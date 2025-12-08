@@ -13,7 +13,10 @@ const CONFIG = {
   DHR_SECRET_KEY: 'sk_jz1yyIaa0Dw2OWhMH0r16gUgWZ7N2PCpb6aK1crKPIFq02aD',
   DHR_API_URL: 'https://api.dhrtecnologialtda.com/v1',
   CHECK_INTERVAL: 5000,
-  PORT: process.env.PORT || 3005
+  PORT: process.env.PORT || 3005,
+  CACHE_TTL: 60000, // Cache de 1 minuto
+  MAX_RETRIES: 3,
+  RETRY_DELAY: 2000 // 2 segundos entre retries
 };
 
 const FILES = {
@@ -23,6 +26,16 @@ const FILES = {
 
 let notifications = [];
 let processedEvents = new Set();
+
+// ===== CACHE =====
+let transactionsCache = {
+  data: null,
+  timestamp: 0
+};
+
+function isCacheValid() {
+  return transactionsCache.data && (Date.now() - transactionsCache.timestamp < CONFIG.CACHE_TTL);
+}
 
 // ===== UTILITÁRIOS =====
 
@@ -43,22 +56,53 @@ function getAuth() {
   return 'Basic ' + Buffer.from(`${CONFIG.DHR_PUBLIC_KEY}:${CONFIG.DHR_SECRET_KEY}`).toString('base64');
 }
 
-async function fetchDHR(endpoint) {
-  const response = await fetch(`${CONFIG.DHR_API_URL}${endpoint}`, {
-    headers: { 'Authorization': getAuth() }
-  });
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  return response.json();
+// Função de delay para retry
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Buscar TODAS as transações com paginação automática
-async function fetchAllTransactions() {
+// Fetch com retry automático
+async function fetchDHR(endpoint, retries = CONFIG.MAX_RETRIES) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const response = await fetch(`${CONFIG.DHR_API_URL}${endpoint}`, {
+        headers: { 
+          'Authorization': getAuth(),
+          'Connection': 'keep-alive'
+        },
+        timeout: 30000 // 30 segundos de timeout
+      });
+      
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      
+      return await response.json();
+    } catch (error) {
+      if (attempt === retries) {
+        console.error(`  ❌ Falha após ${retries} tentativas: ${error.message}`);
+        throw error;
+      }
+      console.log(`  ⚠️  Tentativa ${attempt}/${retries} falhou, tentando novamente em ${CONFIG.RETRY_DELAY}ms...`);
+      await delay(CONFIG.RETRY_DELAY);
+    }
+  }
+}
+
+// Buscar TODAS as transações com paginação automática e cache
+async function fetchAllTransactions(forceRefresh = false) {
+  // Verificar cache primeiro
+  if (!forceRefresh && isCacheValid()) {
+    console.log('📦 Usando dados do cache');
+    return transactionsCache.data;
+  }
+
   let allTransactions = [];
   let page = 1;
   const pageSize = 200;
   let totalPages = null;
   
-  console.log('🔄 Buscando todas as transações...');
+  console.log('🔄 Buscando todas as transações da API...');
   
   while (true) {
     try {
@@ -91,6 +135,11 @@ async function fetchAllTransactions() {
       }
       
       page++;
+      
+      // Pequeno delay entre páginas para não sobrecarregar a API
+      if (page % 5 === 0) {
+        await delay(500);
+      }
     } catch (error) {
       console.error(`  ❌ Erro na página ${page}:`, error.message);
       break;
@@ -98,6 +147,13 @@ async function fetchAllTransactions() {
   }
   
   console.log(`✅ Total de transações buscadas: ${allTransactions.length}`);
+  
+  // Atualizar cache
+  transactionsCache = {
+    data: allTransactions,
+    timestamp: Date.now()
+  };
+  
   return allTransactions;
 }
 
@@ -401,7 +457,7 @@ async function checkEvents() {
 
     await saveFile(FILES.processed, Array.from(processedEvents));
   } catch (err) {
-    console.error('Erro:', err.message);
+    console.error('Erro ao verificar eventos:', err.message);
   }
 }
 
@@ -419,7 +475,7 @@ async function sendNotifs(tx) {
       });
       console.log(`✅ Notificação enviada: ${n.name}`);
     } catch (err) {
-      console.error(`❌ Erro: ${err.message}`);
+      console.error(`❌ Erro ao enviar notificação: ${err.message}`);
     }
   }
 }
@@ -500,116 +556,137 @@ app.get('/api/products-sold-today', async (req, res) => {
   }
 });
 
-app.get('/api/export/csv', async (req, res) => {
+app.get('/api/transactions', async (req, res) => {
   try {
     let allTxs = await fetchAllTransactions();
-    let txs = applyFilters(allTxs, req.query);
+    allTxs = applyFilters(allTxs, req.query);
     
-    const rows = [
-      ['ID','Data','Cliente','Email','Telefone','Produto','Quantidade','Valor','Status'],
-      ...txs.map(t => [
-        t.id,
-        new Date(t.createdAt).toLocaleString('pt-BR'),
-        t.customer?.name || '',
-        t.customer?.email || '',
-        t.customer?.phone || '',
-        t.items?.[0]?.title || '',
-        t.items?.[0]?.quantity || 1,
-        ((t.amount||0)/100).toFixed(2),
-        t.status
-      ])
-    ];
-
-    res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', 'attachment; filename=leads.csv');
-    res.send(rows.map(r => r.join(',')).join('\n'));
+    const page = parseInt(req.query.page) || 1;
+    const pageSize = parseInt(req.query.pageSize) || 50;
+    const start = (page - 1) * pageSize;
+    const end = start + pageSize;
+    
+    const paginatedTxs = allTxs.slice(start, end);
+    
+    res.json({
+      data: paginatedTxs,
+      pagination: {
+        page,
+        pageSize,
+        totalRecords: allTxs.length,
+        totalPages: Math.ceil(allTxs.length / pageSize)
+      }
+    });
   } catch (err) {
     res.status(500).json({error: err.message});
   }
 });
 
-app.get('/api/export/txt', async (req, res) => {
+app.get('/api/sales', async (req, res) => {
   try {
     let allTxs = await fetchAllTransactions();
-    let txs = applyFilters(allTxs, req.query);
+    allTxs = applyFilters(allTxs, req.query);
     
-    let txt = 'RELATÓRIO DE TRANSAÇÕES DHR PAGAMENTOS\n';
-    txt += '='.repeat(80) + '\n\n';
-    txt += `Data de Geração: ${new Date().toLocaleString('pt-BR')}\n`;
-    txt += `Total de Transações: ${txs.length}\n\n`;
-    txt += '='.repeat(80) + '\n\n';
+    const sales = allTxs
+      .filter(t => t.status === 'paid')
+      .map(t => ({
+        id: t.id,
+        date: t.createdAt,
+        customer: t.customer?.name || 'N/A',
+        email: t.customer?.email || 'N/A',
+        document: t.customer?.document?.number || 'N/A',
+        product: t.items?.[0]?.title || 'N/A',
+        amount: (t.amount || 0) / 100,
+        netAmount: (t.fee?.netAmount || 0) / 100,
+        fee: ((t.amount || 0) - (t.fee?.netAmount || 0)) / 100,
+        method: t.paymentMethod || 'N/A',
+        installments: t.installments || 1
+      }));
     
-    txs.forEach((t, idx) => {
-      txt += `LEAD #${idx + 1}\n`;
-      txt += `-`.repeat(80) + '\n';
-      txt += `ID: ${t.id}\n`;
-      txt += `Data: ${new Date(t.createdAt).toLocaleString('pt-BR')}\n`;
-      txt += `Cliente: ${t.customer?.name || 'N/A'}\n`;
-      txt += `Email: ${t.customer?.email || 'N/A'}\n`;
-      txt += `Telefone: ${t.customer?.phone || 'N/A'}\n`;
-      txt += `Documento: ${t.customer?.document?.number || 'N/A'}\n`;
-      if (t.items && t.items.length > 0) {
-        txt += `Produto: ${t.items[0].title}\n`;
-        txt += `Quantidade: ${t.items[0].quantity}x\n`;
+    res.json(sales);
+  } catch (err) {
+    res.status(500).json({error: err.message});
+  }
+});
+
+app.get('/api/leads', async (req, res) => {
+  try {
+    let allTxs = await fetchAllTransactions();
+    allTxs = applyFilters(allTxs, req.query);
+    
+    const leadsMap = {};
+    
+    allTxs.forEach(t => {
+      const doc = t.customer?.document?.number;
+      if (!doc) return;
+      
+      if (!leadsMap[doc]) {
+        leadsMap[doc] = {
+          document: doc,
+          name: t.customer?.name || 'N/A',
+          email: t.customer?.email || 'N/A',
+          phone: t.customer?.phone || 'N/A',
+          firstPurchase: t.createdAt,
+          lastPurchase: t.createdAt,
+          totalPurchases: 0,
+          paidPurchases: 0,
+          totalSpent: 0,
+          products: new Set()
+        };
       }
-      txt += `Valor: R$ ${((t.amount||0)/100).toFixed(2)}\n`;
-      txt += `Status: ${t.status}\n`;
-      txt += '\n';
+      
+      const lead = leadsMap[doc];
+      lead.totalPurchases++;
+      
+      if (t.status === 'paid') {
+        lead.paidPurchases++;
+        lead.totalSpent += (t.amount || 0) / 100;
+      }
+      
+      if (new Date(t.createdAt) < new Date(lead.firstPurchase)) {
+        lead.firstPurchase = t.createdAt;
+      }
+      if (new Date(t.createdAt) > new Date(lead.lastPurchase)) {
+        lead.lastPurchase = t.createdAt;
+      }
+      
+      if (t.items?.[0]?.title) {
+        const productType = t.items[0].title.split(' - ')[0].trim();
+        lead.products.add(productType);
+      }
     });
     
-    txt += '='.repeat(80) + '\n';
-    txt += 'FIM DO RELATÓRIO\n';
-
-    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-    res.setHeader('Content-Disposition', 'attachment; filename=leads.txt');
-    res.send(txt);
-  } catch (err) {
-    res.status(500).json({error: err.message});
-  }
-});
-
-app.get('/api/export/excel', async (req, res) => {
-  try {
-    let allTxs = await fetchAllTransactions();
-    let txs = applyFilters(allTxs, req.query);
+    const leads = Object.values(leadsMap).map(l => ({
+      ...l,
+      products: Array.from(l.products).join(', ')
+    }));
     
-    const rows = [
-      ['ID','Data','Cliente','Email','Telefone','Produto','Quantidade','Valor','Status'],
-      ...txs.map(t => [
-        t.id,
-        new Date(t.createdAt).toLocaleString('pt-BR'),
-        t.customer?.name || '',
-        t.customer?.email || '',
-        t.customer?.phone || '',
-        t.items?.[0]?.title || '',
-        t.items?.[0]?.quantity || 1,
-        ((t.amount||0)/100).toFixed(2),
-        t.status
-      ])
-    ];
-
-    res.setHeader('Content-Type', 'application/vnd.ms-excel');
-    res.setHeader('Content-Disposition', 'attachment; filename=leads.xls');
-    res.send(rows.map(r => r.join('\t')).join('\n'));
+    res.json(leads);
   } catch (err) {
     res.status(500).json({error: err.message});
   }
 });
 
+// Notificações
 app.get('/api/notifications', (req, res) => {
   res.json(notifications);
 });
 
 app.post('/api/notifications', async (req, res) => {
-  const n = {id: Date.now().toString(), enabled: true, ...req.body};
-  notifications.push(n);
+  const notif = {
+    id: Date.now().toString(),
+    enabled: true,
+    ...req.body
+  };
+  notifications.push(notif);
   await saveFile(FILES.notifications, notifications);
-  res.json(n);
+  res.json(notif);
 });
 
 app.put('/api/notifications/:id', async (req, res) => {
   const idx = notifications.findIndex(n => n.id === req.params.id);
   if (idx === -1) return res.status(404).json({error: 'Not found'});
+  
   notifications[idx] = {...notifications[idx], ...req.body};
   await saveFile(FILES.notifications, notifications);
   res.json(notifications[idx]);
@@ -621,59 +698,51 @@ app.delete('/api/notifications/:id', async (req, res) => {
   res.json({success: true});
 });
 
-app.post('/api/notifications/:id/toggle', async (req, res) => {
-  const n = notifications.find(n => n.id === req.params.id);
-  if (!n) return res.status(404).json({error: 'Not found'});
-  n.enabled = !n.enabled;
-  await saveFile(FILES.notifications, notifications);
-  res.json(n);
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    cache: isCacheValid() ? 'valid' : 'expired',
+    transactions: transactionsCache.data?.length || 0
+  });
 });
 
-app.post('/api/notifications/:id/test', async (req, res) => {
-  const n = notifications.find(n => n.id === req.params.id);
-  if (!n) return res.status(404).json({error: 'Not found'});
-  
+// Endpoint para forçar refresh do cache
+app.post('/api/refresh', async (req, res) => {
   try {
-    // Criar transação de teste
-    const testTx = {
-      id: 'TEST123',
-      amount: 3635,
-      customer: {
-        name: 'Cliente Teste',
-        email: 'teste@exemplo.com',
-        document: '12345678900'
-      },
-      paymentMethod: 'pix',
-      createdAt: new Date().toISOString(),
-      installments: 1
-    };
-    
-    const msg = formatMsg(n, testTx);
-    
-    await fetch(n.url, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(msg)
-    });
-    res.json({success: true});
+    console.log('🔄 Forçando atualização do cache...');
+    const txs = await fetchAllTransactions(true);
+    res.json({ success: true, transactions: txs.length });
   } catch (err) {
-    res.status(500).json({success: false, error: err.message});
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ===== INIT =====
+// ===== INICIALIZAÇÃO =====
 
 async function init() {
-  notifications = await loadFile(FILES.notifications, []);
-  const processed = await loadFile(FILES.processed, []);
+  notifications = await loadFile(FILES.notifications);
+  const processed = await loadFile(FILES.processed);
   processedEvents = new Set(processed);
 
   console.log('\n🚀 DHR Analytics PRO');
-  console.log(`📍 http://localhost:${CONFIG.PORT}\n`);
+  console.log(`📍 http://localhost:${CONFIG.PORT}`);
+  console.log(`💾 Cache TTL: ${CONFIG.CACHE_TTL / 1000}s`);
+  console.log(`🔄 Retry: ${CONFIG.MAX_RETRIES} tentativas\n`);
 
-  app.listen(CONFIG.PORT);
+  app.listen(CONFIG.PORT, () => {
+    console.log(`✅ Servidor rodando na porta ${CONFIG.PORT}`);
+  });
+  
+  // Buscar dados iniciais
+  try {
+    await fetchAllTransactions();
+  } catch (err) {
+    console.error('⚠️  Erro ao buscar dados iniciais:', err.message);
+  }
+  
+  // Iniciar verificação de eventos
   setInterval(checkEvents, CONFIG.CHECK_INTERVAL);
-  checkEvents();
 }
 
 init();

@@ -13,7 +13,7 @@ const CONFIG = {
   DHR_SECRET_KEY: 'sk_jz1yyIaa0Dw2OWhMH0r16gUgWZ7N2PCpb6aK1crKPIFq02aD',
   DHR_API_URL: 'https://api.dhrtecnologialtda.com/v1',
   CHECK_INTERVAL: 5000,
-  PORT: 3005
+  PORT: process.env.PORT || 3005
 };
 
 const FILES = {

@@ -280,45 +280,64 @@ function analyzeDashboard(transactions) {
   };
 }
 
-function analyzeProductsSoldToday(transactions) {
-  // Obter data de hoje no horário do Brasil (UTC-3)
-  const now = new Date();
+function analyzeProductsSoldByDate(transactions, startDate = null, endDate = null) {
+  // Se não passar datas, usa hoje
+  let dayStartBrazil, dayEndBrazil;
   
-  // Criar data de hoje 00:00:00 no Brasil usando ISO string
-  const nowUTC = now.getTime();
-  const brazilNow = new Date(nowUTC - (3 * 60 * 60 * 1000)); // UTC-3
+  if (startDate) {
+    // Usar data inicial fornecida (formato: YYYY-MM-DD)
+    const [year, month, day] = startDate.split('-').map(Number);
+    dayStartBrazil = new Date(Date.UTC(year, month - 1, day, 3, 0, 0, 0)); // 00:00 Brasil = 03:00 UTC
+  } else {
+    // Usar hoje
+    const now = new Date();
+    const nowUTC = now.getTime();
+    const brazilNow = new Date(nowUTC - (3 * 60 * 60 * 1000)); // UTC-3
+    dayStartBrazil = new Date(Date.UTC(
+      brazilNow.getUTCFullYear(),
+      brazilNow.getUTCMonth(), 
+      brazilNow.getUTCDate(),
+      3, 0, 0, 0
+    ));
+  }
   
-  // Início do dia no Brasil (00:00:00)
-  const todayStartBrazil = new Date(Date.UTC(
-    brazilNow.getUTCFullYear(),
-    brazilNow.getUTCMonth(), 
-    brazilNow.getUTCDate(),
-    3, 0, 0, 0  // 00:00 Brasil = 03:00 UTC
-  ));
+  if (endDate) {
+    // Usar data final fornecida (formato: YYYY-MM-DD)
+    const [year, month, day] = endDate.split('-').map(Number);
+    dayEndBrazil = new Date(Date.UTC(year, month - 1, day, 3 + 23, 59, 59, 999)); // 23:59 Brasil
+  } else if (startDate) {
+    // Se só passou startDate, usar o mesmo dia como fim
+    const [year, month, day] = startDate.split('-').map(Number);
+    dayEndBrazil = new Date(Date.UTC(year, month - 1, day, 3 + 23, 59, 59, 999));
+  } else {
+    // Usar hoje
+    const now = new Date();
+    const nowUTC = now.getTime();
+    const brazilNow = new Date(nowUTC - (3 * 60 * 60 * 1000));
+    dayEndBrazil = new Date(Date.UTC(
+      brazilNow.getUTCFullYear(),
+      brazilNow.getUTCMonth(),
+      brazilNow.getUTCDate(),
+      3 + 23, 59, 59, 999
+    ));
+  }
   
-  // Fim do dia no Brasil (23:59:59)
-  const todayEndBrazil = new Date(Date.UTC(
-    brazilNow.getUTCFullYear(),
-    brazilNow.getUTCMonth(),
-    brazilNow.getUTCDate(),
-    3 + 23, 59, 59, 999  // 23:59 Brasil = 02:59 UTC do dia seguinte
-  ));
+  const dateLabel = startDate ? (endDate && endDate !== startDate ? `${startDate} a ${endDate}` : startDate) : 'hoje';
+  console.log(`📅 Filtrando vendas de ${dateLabel} (Brasil):`);
+  console.log(`  Início: ${dayStartBrazil.toISOString()} (UTC)`);
+  console.log(`  Fim: ${dayEndBrazil.toISOString()} (UTC)`);
   
-  console.log(`📅 Filtrando vendas de hoje (Brasil):`);
-  console.log(`  Início: ${todayStartBrazil.toISOString()} (UTC) = ${new Date(todayStartBrazil.getTime() - 3*60*60*1000).toISOString().replace('T', ' ').slice(0, 19)} (Brasil)`);
-  console.log(`  Fim: ${todayEndBrazil.toISOString()} (UTC) = ${new Date(todayEndBrazil.getTime() - 3*60*60*1000).toISOString().replace('T', ' ').slice(0, 19)} (Brasil)`);
-  
-  // Filtrar apenas transações de hoje
-  const todayTxs = transactions.filter(t => {
+  // Filtrar transações pelo período
+  const filteredTxs = transactions.filter(t => {
     const txTime = new Date(t.createdAt).getTime();
-    return txTime >= todayStartBrazil.getTime() && txTime <= todayEndBrazil.getTime();
+    return txTime >= dayStartBrazil.getTime() && txTime <= dayEndBrazil.getTime();
   });
   
-  console.log(`  ✅ ${todayTxs.length} transações encontradas hoje`);
+  console.log(`  ✅ ${filteredTxs.length} transações encontradas`);
   
   const productMap = {};
   
-  todayTxs.forEach(t => {
+  filteredTxs.forEach(t => {
     if (t.items && t.items[0] && t.items[0].title) {
       // Extrair apenas o código da passarela, removendo " - Placa XXX"
       let productName = t.items[0].title;
@@ -369,6 +388,11 @@ function analyzeProductsSoldToday(transactions) {
     .sort((a, b) => b.paidNetAmount - a.paidNetAmount);
   
   return products;
+}
+
+// Manter compatibilidade com a função antiga
+function analyzeProductsSoldToday(transactions) {
+  return analyzeProductsSoldByDate(transactions, null, null);
 }
 
 function analyzePIX(transactions) {
@@ -548,11 +572,14 @@ app.get('/api/pix', async (req, res) => {
 
 app.get('/api/products-sold-today', async (req, res) => {
   try {
+    const { startDate, endDate } = req.query;
     const txs = await fetchAllTransactions();
-    const products = analyzeProductsSoldToday(txs);
+    const products = analyzeProductsSoldByDate(txs, startDate || null, endDate || null);
     res.json(products);
   } catch (err) {
     res.status(500).json({error: err.message});
+  }
+});
   }
 });
 

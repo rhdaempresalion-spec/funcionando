@@ -31,13 +31,14 @@ document.addEventListener('DOMContentLoaded', () => {
   loadNotifications();
   loadAnalysisData();
   
-  // Auto-refresh a cada 3 segundos para atualização em tempo real
-  setInterval(() => {
-    const activeTab = document.querySelector('.tab.active')?.dataset.tab;
-    if (activeTab === 'dashboard') loadDashboard();
-    if (activeTab === 'pix') loadPIX();
-    if (activeTab === 'analysis') updateAnalysis();
-  }, 3000);
+  // Auto-refresh DESATIVADO - atualização manual via botão
+  // Para reativar, descomente o código abaixo:
+  // setInterval(() => {
+  //   const activeTab = document.querySelector('.tab.active')?.dataset.tab;
+  //   if (activeTab === 'dashboard') loadDashboard();
+  //   if (activeTab === 'pix') loadPIX();
+  //   if (activeTab === 'analysis') updateAnalysis();
+  // }, 30000); // 30 segundos
 });
 
 // ===== TABS =====
@@ -176,48 +177,31 @@ async function loadDashboard() {
 }
 
 async function loadProductsSoldToday() {
-  // Define a data de hoje nos inputs
-  const today = new Date().toISOString().split('T')[0];
-  const startInput = document.getElementById('products-start-date');
-  const endInput = document.getElementById('products-end-date');
+  // USA OS MESMOS FILTROS DO DASHBOARD PRINCIPAL
+  const startDate = currentFilters.startDate || new Date().toISOString().split('T')[0];
+  const endDate = currentFilters.endDate || startDate;
   
-  if (startInput) startInput.value = today;
-  if (endInput) endInput.value = today;
-  
-  // Atualiza o label
-  const label = document.getElementById('products-date-label');
-  if (label) label.textContent = 'Mostrando vendas de hoje';
-  
-  // Carrega os produtos de hoje
-  await loadProductsSold(today, today);
-}
-
-async function loadProductsSoldByDate() {
-  const startDate = document.getElementById('products-start-date')?.value;
-  const endDate = document.getElementById('products-end-date')?.value;
-  
-  if (!startDate) {
-    showToast('⚠️ Selecione a data inicial');
-    return;
-  }
-  
-  const finalEndDate = endDate || startDate;
-  
-  // Atualiza o label
+  // Atualiza o label com o periodo selecionado
   const label = document.getElementById('products-date-label');
   if (label) {
-    if (startDate === finalEndDate) {
-      const dateObj = new Date(startDate + 'T12:00:00');
-      const formatted = dateObj.toLocaleDateString('pt-BR');
-      label.textContent = `Mostrando vendas de ${formatted}`;
+    if (startDate === endDate) {
+      const today = new Date().toISOString().split('T')[0];
+      if (startDate === today) {
+        label.textContent = 'Mostrando vendas de hoje';
+      } else {
+        const dateObj = new Date(startDate + 'T12:00:00');
+        const formatted = dateObj.toLocaleDateString('pt-BR');
+        label.textContent = 'Mostrando vendas de ' + formatted;
+      }
     } else {
       const startObj = new Date(startDate + 'T12:00:00');
-      const endObj = new Date(finalEndDate + 'T12:00:00');
-      label.textContent = `Mostrando vendas de ${startObj.toLocaleDateString('pt-BR')} até ${endObj.toLocaleDateString('pt-BR')}`;
+      const endObj = new Date(endDate + 'T12:00:00');
+      label.textContent = 'Mostrando vendas de ' + startObj.toLocaleDateString('pt-BR') + ' ate ' + endObj.toLocaleDateString('pt-BR');
     }
   }
   
-  await loadProductsSold(startDate, finalEndDate);
+  // Carrega os produtos do periodo selecionado no filtro principal
+  await loadProductsSold(startDate, endDate);
 }
 
 async function loadProductsSold(startDate = null, endDate = null) {

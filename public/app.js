@@ -339,9 +339,7 @@ function analyzeProductsSoldByDate(transactions, startDate = null, endDate = nul
   
   filteredTxs.forEach(t => {
     if (t.items && t.items[0] && t.items[0].title) {
-      // Extrair apenas o código da passarela, removendo " - Placa XXX"
       let productName = t.items[0].title;
-      // Remove a parte da placa (ex: " - Placa FKO2094")
       productName = productName.replace(/\s*-\s*Placa\s+[A-Z0-9]+/i, '');
       
       const quantity = t.items[0].quantity || 1;
@@ -377,14 +375,13 @@ function analyzeProductsSoldByDate(transactions, startDate = null, endDate = nul
     }
   });
   
-  // Converter para array e ordenar por valor líquido (maior para menor)
   const products = Object.values(productMap)
     .map(p => ({
       ...p,
       avgTicket: p.paidSales > 0 ? (p.paidAmount / p.paidSales).toFixed(2) : '0.00',
       avgNetTicket: p.paidSales > 0 ? (p.paidNetAmount / p.paidSales).toFixed(2) : '0.00'
     }))
-    .filter(p => p.paidSales > 0) // Mostrar apenas produtos com vendas pagas
+    .filter(p => p.paidSales > 0)
     .sort((a, b) => b.paidNetAmount - a.paidNetAmount);
   
   return products;

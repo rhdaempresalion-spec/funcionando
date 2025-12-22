@@ -580,8 +580,6 @@ app.get('/api/products-sold-today', async (req, res) => {
     res.status(500).json({error: err.message});
   }
 });
-  }
-});
 
 app.get('/api/transactions', async (req, res) => {
   try {

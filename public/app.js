@@ -1,734 +1,773 @@
-// ===== ESTADO GLOBAL =====
-let currentFilters = {
-  startDate: '',
-  endDate: '',
-  status: 'all',
-  paymentMethod: 'all',
-  products: []
+import express from 'express';
+import fetch from 'node-fetch';
+import fs from 'fs/promises';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { decodePIX } from './pix-decoder.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const CONFIG = {
+  DHR_PUBLIC_KEY: 'pk_WNNg2i_r8_iqeG3XrdJFI_q1I8ihd1yLoUa08Ip0LKaqxXxE',
+  DHR_SECRET_KEY: 'sk_jz1yyIaa0Dw2OWhMH0r16gUgWZ7N2PCpb6aK1crKPIFq02aD',
+  DHR_API_URL: 'https://api.dhrtecnologialtda.com/v1',
+  CHECK_INTERVAL: 5000,
+  PORT: process.env.PORT || 3005,
+  CACHE_TTL: 60000, // Cache de 1 minuto
+  MAX_RETRIES: 3,
+  RETRY_DELAY: 2000 // 2 segundos entre retries
 };
 
-let analysisData = {
-  adSpend: 0,
-  leads: 0,
-  chargeback: 0
+const FILES = {
+  notifications: path.join(__dirname, 'notifications.json'),
+  processed: path.join(__dirname, 'processed.json')
 };
 
-let dashboardData = null;
-let editingNotificationId = null;
+let notifications = [];
+let processedEvents = new Set();
 
-let charts = {
-  hourly: null,
-  weekday: null,
-  amounts: null
+// ===== CACHE =====
+let transactionsCache = {
+  data: null,
+  timestamp: 0
 };
 
-// ===== INICIALIZAÇÃO =====
-document.addEventListener('DOMContentLoaded', () => {
-  setupTabs();
-  setupFilters();
-  loadProducts();
-  loadDashboard();
-  loadNotifications();
-  loadAnalysisData();
-  
-  // Auto-refresh a cada 3 segundos para atualização em tempo real
-  setInterval(() => {
-    const activeTab = document.querySelector('.tab.active')?.dataset.tab;
-    if (activeTab === 'dashboard') loadDashboard();
-    if (activeTab === 'pix') loadPIX();
-    if (activeTab === 'analysis') updateAnalysis();
-  }, 3000);
-});
-
-// ===== TABS =====
-function setupTabs() {
-  document.querySelectorAll('.tab').forEach(tab => {
-    tab.addEventListener('click', () => {
-      const tabName = tab.dataset.tab;
-      
-      // Ativar tab
-      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-      tab.classList.add('active');
-      
-      // Mostrar conteúdo
-      document.querySelectorAll('.tab-content').forEach(c => c.classList.add('hidden'));
-      document.getElementById(`tab-${tabName}`).classList.remove('hidden');
-      
-      // Carregar dados
-      if (tabName === 'dashboard') loadDashboard();
-      if (tabName === 'pix') loadPIX();
-      if (tabName === 'analysis') {
-        updateAnalysis();
-        setTimeout(() => calculateAnalysis(), 200);
-      }
-      if (tabName === 'notifications') loadNotifications();
-    });
-  });
+function isCacheValid() {
+  return transactionsCache.data && (Date.now() - transactionsCache.timestamp < CONFIG.CACHE_TTL);
 }
 
-// ===== PRODUTOS =====
-async function loadProducts() {
+// ===== UTILITÁRIOS =====
+
+async function loadFile(filepath, defaultValue = []) {
   try {
-    const response = await fetch('/api/products');
-    const products = await response.json();
-    
-    const select = document.getElementById('filter-products');
-    if (!select) return;
-    
-    select.innerHTML = '<option value="all">Todos</option>';
-    
-    products.forEach(p => {
-      const option = document.createElement('option');
-      option.value = p;
-      option.textContent = p;
-      select.appendChild(option);
-    });
-  } catch (error) {
-    console.error('Erro ao carregar produtos:', error);
+    const data = await fs.readFile(filepath, 'utf-8');
+    return JSON.parse(data);
+  } catch {
+    return defaultValue;
   }
+}
+
+async function saveFile(filepath, data) {
+  await fs.writeFile(filepath, JSON.stringify(data, null, 2));
+}
+
+function getAuth() {
+  return 'Basic ' + Buffer.from(`${CONFIG.DHR_PUBLIC_KEY}:${CONFIG.DHR_SECRET_KEY}`).toString('base64');
+}
+
+// Função de delay para retry
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Fetch com retry automático
+async function fetchDHR(endpoint, retries = CONFIG.MAX_RETRIES) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const response = await fetch(`${CONFIG.DHR_API_URL}${endpoint}`, {
+        headers: { 
+          'Authorization': getAuth(),
+          'Connection': 'keep-alive'
+        },
+        timeout: 30000 // 30 segundos de timeout
+      });
+      
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      
+      return await response.json();
+    } catch (error) {
+      if (attempt === retries) {
+        console.error(`  ❌ Falha após ${retries} tentativas: ${error.message}`);
+        throw error;
+      }
+      console.log(`  ⚠️  Tentativa ${attempt}/${retries} falhou, tentando novamente em ${CONFIG.RETRY_DELAY}ms...`);
+      await delay(CONFIG.RETRY_DELAY);
+    }
+  }
+}
+
+// Buscar TODAS as transações com paginação automática e cache
+async function fetchAllTransactions(forceRefresh = false) {
+  // Verificar cache primeiro
+  if (!forceRefresh && isCacheValid()) {
+    console.log('📦 Usando dados do cache');
+    return transactionsCache.data;
+  }
+
+  let allTransactions = [];
+  let page = 1;
+  const pageSize = 200;
+  let totalPages = null;
+  
+  console.log('🔄 Buscando todas as transações da API...');
+  
+  while (true) {
+    try {
+      const data = await fetchDHR(`/transactions?page=${page}&pageSize=${pageSize}`);
+      const transactions = data.data || [];
+      const pagination = data.pagination || {};
+      
+      // Primeira requisição: descobrir total de páginas
+      if (totalPages === null && pagination.totalPages) {
+        totalPages = pagination.totalPages;
+        console.log(`  📊 Total de registros: ${pagination.totalRecords} (${totalPages} páginas)`);
+      }
+      
+      if (transactions.length === 0) {
+        break;
+      }
+      
+      allTransactions = allTransactions.concat(transactions);
+      console.log(`  📄 Página ${page}/${totalPages || '?'}: ${transactions.length} transações (total: ${allTransactions.length})`);
+      
+      // Parar se chegou na última página
+      if (totalPages && page >= totalPages) {
+        break;
+      }
+      
+      // Limite de segurança: máximo 1000 páginas (200.000 transações)
+      if (page >= 1000) {
+        console.log('  ⚠️  Limite de segurança atingido (1000 páginas)');
+        break;
+      }
+      
+      page++;
+      
+      // Pequeno delay entre páginas para não sobrecarregar a API
+      if (page % 5 === 0) {
+        await delay(500);
+      }
+    } catch (error) {
+      console.error(`  ❌ Erro na página ${page}:`, error.message);
+      break;
+    }
+  }
+  
+  console.log(`✅ Total de transações buscadas: ${allTransactions.length}`);
+  
+  // Atualizar cache
+  transactionsCache = {
+    data: allTransactions,
+    timestamp: Date.now()
+  };
+  
+  return allTransactions;
 }
 
 // ===== FILTROS =====
-function setupFilters() {
-  // Filtros já configurados no HTML
+
+function applyFilters(transactions, filters) {
+  let result = [...transactions];
+
+  if (filters.startDate) {
+    // Ajustar para GMT-3 (São Paulo)
+    const start = new Date(filters.startDate + 'T00:00:00-03:00').getTime();
+    result = result.filter(t => new Date(t.createdAt).getTime() >= start);
+  }
+
+  if (filters.endDate) {
+    // Ajustar para GMT-3 (São Paulo)
+    const end = new Date(filters.endDate + 'T23:59:59-03:00').getTime();
+    result = result.filter(t => new Date(t.createdAt).getTime() <= end);
+  }
+
+  if (filters.status === 'paid') {
+    result = result.filter(t => t.status === 'paid');
+  } else if (filters.status === 'pending') {
+    result = result.filter(t => ['waiting_payment', 'pending'].includes(t.status));
+  }
+
+  if (filters.paymentMethod && filters.paymentMethod !== 'all') {
+    result = result.filter(t => t.paymentMethod === filters.paymentMethod);
+  }
+
+  if (filters.products && filters.products.length > 0) {
+    const productList = filters.products.split(',');
+    result = result.filter(t => {
+      if (!t.items || !t.items[0]) return false;
+      const productType = t.items[0].title.split(' - ')[0].trim();
+      return productList.includes(productType);
+    });
+  }
+
+  return result;
 }
 
-function applyFilters() {
-  const startDate = document.getElementById('filter-start-date').value;
-  const endDate = document.getElementById('filter-end-date').value;
-  const status = document.getElementById('filter-status').value;
-  const method = document.getElementById('filter-method').value;
+// ===== ANÁLISES =====
+
+function analyzeDashboard(transactions) {
+  // transactions já vem filtrado pelo período selecionado
   
-  // Pegar produtos selecionados
-  const productsSelect = document.getElementById('filter-products');
-  const selectedProducts = productsSelect ? Array.from(productsSelect.selectedOptions).map(opt => opt.value) : [];
-  
-  currentFilters = {
-    startDate,
-    endDate,
-    status,
-    paymentMethod: method,
-    products: selectedProducts.includes('all') ? [] : selectedProducts
+  // Calcular leads únicos (CPFs únicos) do período
+  const uniqueLeads = new Set();
+  transactions.forEach(t => {
+    if (t.customer && t.customer.document && t.customer.document.number) {
+      uniqueLeads.add(t.customer.document.number);
+    }
+  });
+  const totalLeads = uniqueLeads.size;
+
+  const calc = (txs) => {
+    const paid = txs.filter(t => t.status === 'paid');
+    const pending = txs.filter(t => ['waiting_payment','pending'].includes(t.status));
+    const paidAmount = paid.reduce((s,t) => s + (t.amount||0), 0) / 100;
+    const netAmount = paid.reduce((s,t) => s + (t.fee?.netAmount||0), 0) / 100;
+    const estimatedFee = paidAmount - netAmount;
+    const refundedAmount = txs.reduce((s,t) => s + (t.refundedAmount||0), 0) / 100;
+    
+    return {
+      total: txs.length,
+      paid: paid.length,
+      pending: pending.length,
+      paidAmount,
+      pendingAmount: pending.reduce((s,t) => s + (t.amount||0), 0) / 100,
+      totalAmount: txs.reduce((s,t) => s + (t.amount||0), 0) / 100,
+      avgTicket: paid.length ? paid.reduce((s,t) => s + (t.amount||0), 0) / paid.length / 100 : 0,
+      conversion: txs.length ? (paid.length / txs.length * 100).toFixed(1) : 0,
+      netAmount,
+      estimatedFee,
+      refundedAmount
+    };
   };
-  
-  loadDashboard();
-  showToast('✅ Filtros aplicados');
-}
 
-function clearFilters() {
-  document.getElementById('filter-start-date').value = '';
-  document.getElementById('filter-end-date').value = '';
-  document.getElementById('filter-status').value = 'all';
-  document.getElementById('filter-method').value = 'all';
+  // Calcular vendas por hora (baseado no período filtrado)
+  const hourly = Array(24).fill(0).map(() => ({sales:0, amount:0}));
+  transactions.filter(t => t.status === 'paid').forEach(t => {
+    const date = new Date(t.createdAt);
+    const utcHour = date.getUTCHours();
+    const spHour = (utcHour - 3 + 24) % 24;
+    hourly[spHour].sales++;
+    hourly[spHour].amount += (t.amount||0) / 100;
+  });
+
+  const bestHour = hourly.reduce((best, curr, idx) => 
+    curr.sales > hourly[best].sales ? idx : best, 0);
+
+  // Calcular vendas por dia da semana (baseado no período filtrado)
+  const weekdays = ['Dom','Seg','Ter','Qua','Qui','Sex','Sáb'];
+  const byWeekday = weekdays.map(d => ({day:d, sales:0, amount:0}));
+  transactions.filter(t => t.status === 'paid').forEach(t => {
+    const date = new Date(t.createdAt);
+    const spDate = new Date(date.getTime() - 3 * 60 * 60 * 1000);
+    const d = spDate.getUTCDay();
+    byWeekday[d].sales++;
+    byWeekday[d].amount += (t.amount||0) / 100;
+  });
+
+  // Calcular últimos 7 e 30 dias baseado na data final do período
+  const allTxs = transactions;
+  const latestDate = allTxs.length > 0 
+    ? Math.max(...allTxs.map(t => new Date(t.createdAt).getTime()))
+    : Date.now();
   
-  const productsSelect = document.getElementById('filter-products');
-  if (productsSelect) {
-    Array.from(productsSelect.options).forEach(opt => {
-      opt.selected = opt.value === 'all';
-    });
-  }
+  const weekAgo = new Date(latestDate - 7*86400000);
+  const monthAgo = new Date(latestDate - 30*86400000);
   
-  currentFilters = {
-    startDate: '',
-    endDate: '',
-    status: 'all',
-    paymentMethod: 'all',
-    products: []
+  const weekTxs = allTxs.filter(t => new Date(t.createdAt) >= weekAgo);
+  const monthTxs = allTxs.filter(t => new Date(t.createdAt) >= monthAgo);
+
+  return {
+    period: calc(transactions),  // Renomear de "today" para "period"
+    week: calc(weekTxs),
+    month: calc(monthTxs),
+    hourly,
+    bestHour: `${bestHour}:00`,
+    weekdayStats: byWeekday,
+    totalLeads: totalLeads
   };
-  
-  loadDashboard();
-  showToast('🔄 Filtros limpos');
 }
 
-function buildQueryString() {
-  const params = new URLSearchParams();
-  if (currentFilters.startDate) params.append('startDate', currentFilters.startDate);
-  if (currentFilters.endDate) params.append('endDate', currentFilters.endDate);
-  if (currentFilters.status !== 'all') params.append('status', currentFilters.status);
-  if (currentFilters.paymentMethod !== 'all') params.append('paymentMethod', currentFilters.paymentMethod);
-  if (currentFilters.products && currentFilters.products.length > 0) {
-    params.append('products', currentFilters.products.join(','));
-  }
-  return params.toString();
-}
-
-// ===== DASHBOARD =====
-async function loadDashboard() {
-  try {
-    const query = buildQueryString();
-    const response = await fetch(`/api/dashboard?${query}`);
-    const data = await response.json();
-    
-    dashboardData = data;
-    updateDashboardCards(data);
-    updateCharts(data);
-    loadProductsSoldToday();
-    
-    // Atualizar análise se a aba estiver ativa
-    const activeTab = document.querySelector('.tab.active')?.dataset.tab;
-    if (activeTab === 'analysis') {
-      calculateAnalysis();
-    }
-  } catch (error) {
-    console.error('Erro ao carregar dashboard:', error);
-    showToast('❌ Erro ao carregar dados');
-  }
-}
-
-async function loadProductsSoldToday() {
-  // Define a data de hoje nos inputs
-  const today = new Date().toISOString().split('T')[0];
-  const startInput = document.getElementById('products-start-date');
-  const endInput = document.getElementById('products-end-date');
+function analyzeProductsSoldByDate(transactions, startDate = null, endDate = null) {
+  // Se não passar datas, usa hoje
+  let dayStartBrazil, dayEndBrazil;
   
-  if (startInput) startInput.value = today;
-  if (endInput) endInput.value = today;
-  
-  // Atualiza o label
-  const label = document.getElementById('products-date-label');
-  if (label) label.textContent = 'Mostrando vendas de hoje';
-  
-  // Carrega os produtos de hoje
-  await loadProductsSold(today, today);
-}
-
-async function loadProductsSoldByDate() {
-  const startDate = document.getElementById('products-start-date')?.value;
-  const endDate = document.getElementById('products-end-date')?.value;
-  
-  if (!startDate) {
-    showToast('⚠️ Selecione a data inicial');
-    return;
+  if (startDate) {
+    // Usar data inicial fornecida (formato: YYYY-MM-DD)
+    const [year, month, day] = startDate.split('-').map(Number);
+    dayStartBrazil = new Date(Date.UTC(year, month - 1, day, 3, 0, 0, 0)); // 00:00 Brasil = 03:00 UTC
+  } else {
+    // Usar hoje
+    const now = new Date();
+    const nowUTC = now.getTime();
+    const brazilNow = new Date(nowUTC - (3 * 60 * 60 * 1000)); // UTC-3
+    dayStartBrazil = new Date(Date.UTC(
+      brazilNow.getUTCFullYear(),
+      brazilNow.getUTCMonth(), 
+      brazilNow.getUTCDate(),
+      3, 0, 0, 0
+    ));
   }
   
-  const finalEndDate = endDate || startDate;
-  
-  // Atualiza o label
-  const label = document.getElementById('products-date-label');
-  if (label) {
-    if (startDate === finalEndDate) {
-      const dateObj = new Date(startDate + 'T12:00:00');
-      const formatted = dateObj.toLocaleDateString('pt-BR');
-      label.textContent = `Mostrando vendas de ${formatted}`;
-    } else {
-      const startObj = new Date(startDate + 'T12:00:00');
-      const endObj = new Date(finalEndDate + 'T12:00:00');
-      label.textContent = `Mostrando vendas de ${startObj.toLocaleDateString('pt-BR')} até ${endObj.toLocaleDateString('pt-BR')}`;
-    }
+  if (endDate) {
+    // Usar data final fornecida (formato: YYYY-MM-DD)
+    const [year, month, day] = endDate.split('-').map(Number);
+    dayEndBrazil = new Date(Date.UTC(year, month - 1, day, 3 + 23, 59, 59, 999)); // 23:59 Brasil
+  } else if (startDate) {
+    // Se só passou startDate, usar o mesmo dia como fim
+    const [year, month, day] = startDate.split('-').map(Number);
+    dayEndBrazil = new Date(Date.UTC(year, month - 1, day, 3 + 23, 59, 59, 999));
+  } else {
+    // Usar hoje
+    const now = new Date();
+    const nowUTC = now.getTime();
+    const brazilNow = new Date(nowUTC - (3 * 60 * 60 * 1000));
+    dayEndBrazil = new Date(Date.UTC(
+      brazilNow.getUTCFullYear(),
+      brazilNow.getUTCMonth(),
+      brazilNow.getUTCDate(),
+      3 + 23, 59, 59, 999
+    ));
   }
   
-  await loadProductsSold(startDate, finalEndDate);
-}
-
-async function loadProductsSold(startDate = null, endDate = null) {
-  try {
-    let url = '/api/products-sold-today';
-    const params = new URLSearchParams();
-    
-    if (startDate) params.append('startDate', startDate);
-    if (endDate) params.append('endDate', endDate);
-    
-    if (params.toString()) {
-      url += '?' + params.toString();
-    }
-    
-    const response = await fetch(url);
-    const products = await response.json();
-    
-    const container = document.getElementById('products-sold-container');
-    if (!container) return;
-    
-    if (products.length === 0) {
-      container.innerHTML = '<div style="padding: 20px; text-align: center; color: var(--text-muted);">Nenhum produto vendido no período selecionado</div>';
-      return;
-    }
-    
-    let html = '<div class="table-container"><table>';
-    html += '<thead><tr>';
-    html += '<th>Produto</th>';
-    html += '<th style="text-align: center;">Vendas Pagas</th>';
-    html += '<th style="text-align: center;">Quantidade</th>';
-    html += '<th style="text-align: right;">Valor Líquido Recebido</th>';
-    html += '<th style="text-align: right;">Ticket Médio Líquido</th>';
-    html += '</tr></thead><tbody>';
-    
-    products.forEach(product => {
-      html += '<tr>';
-      html += `<td><strong>${product.name}</strong></td>`;
-      html += `<td style="text-align: center;">`;
-      html += `<span class="badge badge-success">${product.paidSales}</span>`;
-      html += `</td>`;
-      html += `<td style="text-align: center;">${product.paidSales}x</td>`;
-      html += `<td style="text-align: right;"><strong>${formatMoney(product.paidNetAmount)}</strong></td>`;
-      html += `<td style="text-align: right;">${formatMoney(parseFloat(product.avgNetTicket))}</td>`;
-      html += '</tr>';
-    });
-    
-    html += '</tbody></table></div>';
-    container.innerHTML = html;
-  } catch (error) {
-    console.error('Erro ao carregar produtos vendidos:', error);
-    const container = document.getElementById('products-sold-container');
-    if (container) {
-      container.innerHTML = '<div style="padding: 20px; text-align: center; color: var(--danger);">Erro ao carregar produtos</div>';
-    }
-  }
-}
-
-function updateDashboardCards(data) {
-  // Usar data.period em vez de data.today (período filtrado)
-  const periodData = data.period || data.today; // Fallback para compatibilidade
+  const dateLabel = startDate ? (endDate && endDate !== startDate ? `${startDate} a ${endDate}` : startDate) : 'hoje';
+  console.log(`📅 Filtrando vendas de ${dateLabel} (Brasil):`);
+  console.log(`  Início: ${dayStartBrazil.toISOString()} (UTC)`);
+  console.log(`  Fim: ${dayEndBrazil.toISOString()} (UTC)`);
   
-  // Lucro Líquido do Período
-  document.getElementById('net-amount').textContent = formatMoney(periodData.netAmount);
-  const fee = periodData.estimatedFee || 0;
-  document.getElementById('net-subtitle').textContent = `Taxa: ${formatMoney(fee)}`;
+  // Filtrar transações pelo período
+  const filteredTxs = transactions.filter(t => {
+    const txTime = new Date(t.createdAt).getTime();
+    return txTime >= dayStartBrazil.getTime() && txTime <= dayEndBrazil.getTime();
+  });
   
-  // Vendas Pagas do Período
-  document.getElementById('today-paid-amount').textContent = formatMoney(periodData.paidAmount);
-  document.getElementById('today-paid-count').textContent = `${periodData.paid} transações`;
+  console.log(`  ✅ ${filteredTxs.length} transações encontradas`);
   
-  // Vendas Pendentes do Período
-  document.getElementById('today-pending-amount').textContent = formatMoney(periodData.pendingAmount);
-  document.getElementById('today-pending-count').textContent = `${periodData.pending} transações`;
+  const productMap = {};
   
-  // Ticket Médio
-  document.getElementById('avg-ticket').textContent = formatMoney(periodData.avgTicket);
-  
-  // Últimos 7 dias (baseado na data final do período)
-  document.getElementById('week-paid-amount').textContent = formatMoney(data.week.paidAmount);
-  document.getElementById('week-paid-count').textContent = `${data.week.paid} transações`;
-  
-  // Últimos 30 dias (baseado na data final do período)
-  document.getElementById('month-paid-amount').textContent = formatMoney(data.month.paidAmount);
-  document.getElementById('month-paid-count').textContent = `${data.month.paid} transações`;
-  
-  // Taxa de Conversão
-  document.getElementById('conversion-rate').textContent = periodData.conversion + '%';
-  
-  // Melhor horário
-  document.getElementById('best-hour').textContent = data.bestHour;
-}
-
-function updateCharts(data) {
-  // Gráfico por hora
-  const hourlyCtx = document.getElementById('chart-hourly')?.getContext('2d');
-  if (hourlyCtx) {
-    if (charts.hourly) charts.hourly.destroy();
-    
-    charts.hourly = new Chart(hourlyCtx, {
-      type: 'bar',
-      data: {
-        labels: data.hourly.map((_, i) => `${i}:00`),
-        datasets: [{
-          label: 'Vendas',
-          data: data.hourly.map(h => h.sales),
-          backgroundColor: '#3b82f6'
-        }]
-      },
-      options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        plugins: {
-          legend: { display: false }
-        },
-        scales: {
-          y: { beginAtZero: true }
-        }
+  filteredTxs.forEach(t => {
+    if (t.items && t.items[0] && t.items[0].title) {
+      // Extrair apenas o código da passarela, removendo " - Placa XXX"
+      let productName = t.items[0].title;
+      // Remove a parte da placa (ex: " - Placa FKO2094")
+      productName = productName.replace(/\s*-\s*Placa\s+[A-Z0-9]+/i, '');
+      
+      const quantity = t.items[0].quantity || 1;
+      const amount = (t.amount || 0) / 100;
+      
+      if (!productMap[productName]) {
+        productMap[productName] = {
+          name: productName,
+          totalSales: 0,
+          totalQuantity: 0,
+          totalAmount: 0,
+          paidSales: 0,
+          paidAmount: 0,
+          paidNetAmount: 0,
+          pendingSales: 0,
+          pendingAmount: 0
+        };
       }
-    });
-  }
-  
-  // Gráfico por dia da semana
-  const weekdayCtx = document.getElementById('chart-weekday')?.getContext('2d');
-  if (weekdayCtx) {
-    if (charts.weekday) charts.weekday.destroy();
-    
-    charts.weekday = new Chart(weekdayCtx, {
-      type: 'bar',
-      data: {
-        labels: data.weekdayStats.map(w => w.day),
-        datasets: [{
-          label: 'Vendas',
-          data: data.weekdayStats.map(w => w.sales),
-          backgroundColor: '#10b981'
-        }]
-      },
-      options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        plugins: {
-          legend: { display: false }
-        },
-        scales: {
-          y: { beginAtZero: true }
-        }
+      
+      productMap[productName].totalSales++;
+      productMap[productName].totalQuantity += quantity;
+      productMap[productName].totalAmount += amount;
+      
+      if (t.status === 'paid') {
+        const netAmount = (t.fee?.netAmount || 0) / 100;
+        productMap[productName].paidSales++;
+        productMap[productName].paidAmount += amount;
+        productMap[productName].paidNetAmount += netAmount;
+      } else if (['waiting_payment', 'pending'].includes(t.status)) {
+        productMap[productName].pendingSales++;
+        productMap[productName].pendingAmount += amount;
       }
-    });
-  }
+    }
+  });
+  
+  // Converter para array e ordenar por valor líquido (maior para menor)
+  const products = Object.values(productMap)
+    .map(p => ({
+      ...p,
+      avgTicket: p.paidSales > 0 ? (p.paidAmount / p.paidSales).toFixed(2) : '0.00',
+      avgNetTicket: p.paidSales > 0 ? (p.paidNetAmount / p.paidSales).toFixed(2) : '0.00'
+    }))
+    .filter(p => p.paidSales > 0) // Mostrar apenas produtos com vendas pagas
+    .sort((a, b) => b.paidNetAmount - a.paidNetAmount);
+  
+  return products;
 }
 
-// ===== ANÁLISE DO DIA =====
-function loadAnalysisData() {
-  const saved = localStorage.getItem('analysisData');
-  if (saved) {
-    analysisData = JSON.parse(saved);
-    const adSpendInput = document.getElementById('input-ad-spend');
-    const leadsInput = document.getElementById('input-leads');
-    const chargebackInput = document.getElementById('input-chargeback');
+// Manter compatibilidade com a função antiga
+function analyzeProductsSoldToday(transactions) {
+  return analyzeProductsSoldByDate(transactions, null, null);
+}
+
+function analyzePIX(transactions) {
+  const pixTxs = transactions.filter(t => t.paymentMethod === 'pix');
+  const paid = pixTxs.filter(t => t.status === 'paid');
+  const pending = pixTxs.filter(t => ['waiting_payment','pending'].includes(t.status));
+
+  const merchantMap = {};
+  pixTxs.forEach(t => {
+    // Decodificar código PIX para extrair MERCHANT/ADQUIRENTE
+    const pixInfo = decodePIX(t.pix?.qrcode);
+    const name = pixInfo.full; // Ex: VIXONSISTEMALTDA/pagsm.com.br
     
-    if (adSpendInput) adSpendInput.value = analysisData.adSpend || '';
-    if (leadsInput) leadsInput.value = analysisData.leads || '';
-    if (chargebackInput) chargebackInput.value = analysisData.chargeback || '';
-  }
-}
+    if (!merchantMap[name]) {
+      merchantMap[name] = {
+        name,
+        merchant: pixInfo.merchant,
+        acquirer: pixInfo.acquirer,
+        total: 0,
+        paid: 0,
+        pending: 0,
+        amount: 0
+      };
+    }
+    merchantMap[name].total++;
+    if (t.status === 'paid') {
+      merchantMap[name].paid++;
+      merchantMap[name].amount += (t.amount||0) / 100;
+    } else if (['waiting_payment','pending'].includes(t.status)) {
+      merchantMap[name].pending++;
+    }
+  });
 
-function saveAnalysisData() {
-  localStorage.setItem('analysisData', JSON.stringify(analysisData));
-}
+  const ranking = Object.values(merchantMap).map(m => ({
+    ...m,
+    conversion: m.total ? (m.paid / m.total * 100).toFixed(1) : 0
+  })).sort((a,b) => b.paid - a.paid);
 
-async function updateAnalysis() {
-  if (!dashboardData) {
-    await loadDashboard();
-  }
-  calculateAnalysis();
-}
+  const amounts = {};
+  pixTxs.forEach(t => {
+    const amt = ((t.amount||0)/100).toFixed(2);
+    amounts[amt] = (amounts[amt]||0) + 1;
+  });
 
-function calculateAnalysis() {
-  // Pegar valores dos inputs
-  const adSpendInput = document.getElementById('input-ad-spend');
-  const leadsInput = document.getElementById('input-leads');
-  const chargebackInput = document.getElementById('input-chargeback');
-  
-  if (!adSpendInput) return; // Aba não carregada ainda
-  
-  analysisData.adSpend = parseFloat(adSpendInput.value) || 0;
-  // Leads agora vem do backend (CPFs únicos do período)
-  const leadsFromAPI = dashboardData?.totalLeads || 0;
-  analysisData.leads = leadsFromAPI;
-  // Chargeback agora vem do backend (refundedAmount do período)
-  const periodData = dashboardData?.period || dashboardData?.today || {};
-  const chargebackFromAPI = periodData.refundedAmount || 0;
-  analysisData.chargeback = chargebackFromAPI;
-  
-  // Atualizar campo de leads com valor automático
-  if (leadsInput) {
-    leadsInput.value = leadsFromAPI;
-    leadsInput.disabled = true;
-    leadsInput.style.backgroundColor = '#f0f0f0';
-    leadsInput.style.cursor = 'not-allowed';
-  }
-  
-  // Atualizar campo de chargeback com valor automático
-  if (chargebackInput) {
-    chargebackInput.value = chargebackFromAPI.toFixed(2);
-    chargebackInput.disabled = true;
-    chargebackInput.style.backgroundColor = '#f0f0f0';
-    chargebackInput.style.cursor = 'not-allowed';
-  }
-  
-  saveAnalysisData();
-  
-  if (!dashboardData) return;
-  
-  // Usar dados do período filtrado (periodData já foi declarado acima)
-  const revenue = periodData.paidAmount || 0;
-  const profit = periodData.netAmount || 0;
-  const fees = periodData.estimatedFee || 0;
-  const sales = periodData.paid || 0;
-  
-  // Atualizar cards principais
-  const revenueEl = document.getElementById('analysis-revenue');
-  const profitEl = document.getElementById('analysis-profit');
-  const feesEl = document.getElementById('analysis-fees');
-  
-  if (revenueEl) revenueEl.textContent = formatMoney(revenue);
-  if (profitEl) profitEl.textContent = formatMoney(profit);
-  if (feesEl) feesEl.textContent = formatMoney(fees);
-  
-  // Calcular métricas
-  const adSpend = analysisData.adSpend;
-  const leads = analysisData.leads;
-  const chargeback = analysisData.chargeback;
-  
-  // ROI = ((Lucro - Investimento) / Investimento) * 100
-  const roi = adSpend > 0 ? ((profit - adSpend) / adSpend * 100) : 0;
-  const roiEl = document.getElementById('metric-roi');
-  if (roiEl) {
-    roiEl.textContent = roi.toFixed(1) + '%';
-    roiEl.style.color = roi >= 0 ? '#10b981' : '#ef4444';
-  }
-  
-  // ROAS = Receita / Gasto com Anúncios
-  const roas = adSpend > 0 ? (revenue / adSpend) : 0;
-  const roasEl = document.getElementById('metric-roas');
-  if (roasEl) roasEl.textContent = roas.toFixed(2) + 'x';
-  
-  // Margem de Lucro = (Lucro Líquido / Receita) * 100
-  const margin = revenue > 0 ? ((profit - adSpend - chargeback) / revenue * 100) : 0;
-  const marginEl = document.getElementById('metric-margin');
-  if (marginEl) {
-    marginEl.textContent = margin.toFixed(1) + '%';
-    marginEl.style.color = margin >= 0 ? '#10b981' : '#ef4444';
-  }
-  
-  // Custo por Lead
-  const cpl = leads > 0 ? (adSpend / leads) : 0;
-  const cplEl = document.getElementById('metric-cpl');
-  if (cplEl) cplEl.textContent = formatMoney(cpl);
-  
-  // CPA (Custo por Aquisição)
-  const cpa = sales > 0 ? (adSpend / sales) : 0;
-  const cpaEl = document.getElementById('metric-cpa');
-  if (cpaEl) cpaEl.textContent = formatMoney(cpa);
-  
-  // Reembolsos
-  const refunded = dashboardData.today.refundedAmount || 0;
-  const lossesEl = document.getElementById('metric-losses');
-  if (lossesEl) lossesEl.textContent = formatMoney(refunded);
-}
+  const topAmounts = Object.entries(amounts)
+    .map(([amt, cnt]) => ({amount:parseFloat(amt), count:cnt}))
+    .sort((a,b) => b.count - a.count)
+    .slice(0,10);
 
-// ===== PIX =====
-async function loadPIX() {
-  try {
-    const query = buildQueryString();
-    const response = await fetch(`/api/pix?${query}`);
-    const data = await response.json();
-    
-    // Atualizar cards
-    document.getElementById('pix-total').textContent = data.total;
-    document.getElementById('pix-paid').textContent = data.paid;
-    document.getElementById('pix-pending').textContent = data.pending;
-    document.getElementById('pix-merchants').textContent = data.uniqueMerchants;
-    document.getElementById('pix-conversion').textContent = data.conversionRate + '%';
-    document.getElementById('pix-avg-time').textContent = data.avgPaymentTime;
-    
-    // Ranking
-    const rankingContainer = document.getElementById('merchant-ranking');
-    rankingContainer.innerHTML = data.ranking.slice(0, 10).map((m, idx) => `
-      <div class="ranking-item">
-        <div class="ranking-position">#${idx + 1}</div>
-        <div class="ranking-info">
-          <div class="ranking-name">${m.merchant}</div>
-          <div class="ranking-acquirer">${m.acquirer}</div>
-        </div>
-        <div class="ranking-stats">
-          <div>${m.total} PIX</div>
-          <div style="color: var(--success)">${m.paid} pagos</div>
-          <div>${m.conversion}% conversão</div>
-        </div>
-      </div>
-    `).join('');
-    
-    // Top valores
-    const valuesContainer = document.getElementById('top-values');
-    valuesContainer.innerHTML = data.topValues.slice(0, 10).map((v, idx) => `
-      <div class="value-item">
-        <span>#${idx + 1}</span>
-        <span>${formatMoney(v.value)}</span>
-        <span>${v.count}x</span>
-      </div>
-    `).join('');
-  } catch (error) {
-    console.error('Erro ao carregar PIX:', error);
+  let avgTime = 0;
+  if (paid.length) {
+    const times = paid.filter(t => t.updatedAt).map(t => 
+      new Date(t.updatedAt) - new Date(t.createdAt)
+    );
+    if (times.length) avgTime = times.reduce((s,t) => s+t, 0) / times.length / 60000;
   }
+
+  return {
+    total: pixTxs.length,
+    paid: paid.length,
+    pending: pending.length,
+    uniqueMerchants: Object.keys(merchantMap).length,
+    conversionRate: pixTxs.length ? (paid.length / pixTxs.length * 100).toFixed(1) : 0,
+    avgPaymentTime: avgTime.toFixed(1) + ' min',
+    ranking: ranking,
+    topValues: topAmounts.map(a => ({value: a.amount, count: a.count}))
+  };
 }
 
 // ===== NOTIFICAÇÕES =====
-async function loadNotifications() {
+
+async function checkEvents() {
   try {
-    const response = await fetch('/api/notifications');
-    const notifications = await response.json();
-    
-    const container = document.getElementById('notifications-list');
-    
-    if (notifications.length === 0) {
-      container.innerHTML = `
-        <div style="text-align: center; padding: 40px; color: var(--text-muted);">
-          <p style="font-size: 16px; margin-bottom: 8px;">Nenhuma notificação configurada</p>
-          <p style="font-size: 14px;">Clique em "Nova Notificação" para começar</p>
-        </div>
-      `;
-      return;
+    const data = await fetchDHR('/transactions?page=1&pageSize=50');
+    const txs = data.data || [];
+
+    for (const tx of txs) {
+      const key = `${tx.id}-${tx.status}`;
+      if (processedEvents.has(key)) continue;
+
+      if (tx.status === 'paid' || tx.status === 'refunded') {
+        await sendNotifs(tx);
+        processedEvents.add(key);
+      }
     }
-    
-    container.innerHTML = notifications.map(n => `
-      <div class="notif-item">
-        <div class="notif-info">
-          <h4>${n.name}</h4>
-          <p>${n.eventType === 'sale_paid' ? '💰 Venda Paga' : '🔄 Reembolso'} • ${n.enabled ? '<span style="color: var(--success)">Ativo</span>' : '<span style="color: var(--text-muted)">Inativo</span>'}</p>
-        </div>
-        <div class="notif-actions">
-          <div class="toggle ${n.enabled ? 'active' : ''}" onclick="toggleNotification('${n.id}')"></div>
-          <button class="btn btn-sm btn-secondary" onclick="editNotification('${n.id}')">✏️ Editar</button>
-          <button class="btn btn-sm btn-secondary" onclick="testNotification('${n.id}')">🧪 Testar</button>
-          <button class="btn btn-sm btn-secondary" onclick="deleteNotification('${n.id}')">🗑️</button>
-        </div>
-      </div>
-    `).join('');
-  } catch (error) {
-    console.error('Erro ao carregar notificações:', error);
+
+    await saveFile(FILES.processed, Array.from(processedEvents));
+  } catch (err) {
+    console.error('Erro ao verificar eventos:', err.message);
   }
 }
 
-function openNotificationModal() {
-  editingNotificationId = null;
-  document.querySelector('#notification-modal .modal-header h3').textContent = 'Nova Notificação';
-  document.getElementById('notification-modal').classList.remove('hidden');
-}
+async function sendNotifs(tx) {
+  const type = tx.status === 'paid' ? 'sale_paid' : 'refund';
+  const active = notifications.filter(n => n.enabled && n.eventType === type);
 
-function closeNotificationModal() {
-  editingNotificationId = null;
-  document.getElementById('notification-modal').classList.add('hidden');
-  document.getElementById('notification-form').reset();
-}
-
-async function editNotification(id) {
-  try {
-    const response = await fetch('/api/notifications');
-    const notifications = await response.json();
-    const notif = notifications.find(n => n.id === id);
-    
-    if (!notif) {
-      showToast('❌ Notificação não encontrada');
-      return;
-    }
-    
-    editingNotificationId = id;
-    
-    document.getElementById('notif-name').value = notif.name;
-    document.getElementById('notif-url').value = notif.url;
-    document.getElementById('notif-event').value = notif.eventType;
-    document.getElementById('notif-title').value = notif.title;
-    document.getElementById('notif-text').value = notif.text;
-    
-    document.querySelector('#notification-modal .modal-header h3').textContent = 'Editar Notificação';
-    document.getElementById('notification-modal').classList.remove('hidden');
-  } catch (error) {
-    console.error('Erro ao editar notificação:', error);
-    showToast('❌ Erro ao carregar notificação');
-  }
-}
-
-document.getElementById('notification-form').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  
-  const data = {
-    name: document.getElementById('notif-name').value,
-    url: document.getElementById('notif-url').value,
-    eventType: document.getElementById('notif-event').value,
-    title: document.getElementById('notif-title').value,
-    text: document.getElementById('notif-text').value,
-    enabled: true
-  };
-  
-  try {
-    if (editingNotificationId) {
-      // Editar existente
-      await fetch(`/api/notifications/${editingNotificationId}`, {
-        method: 'PUT',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(data)
-      });
-      showToast('✅ Notificação atualizada');
-    } else {
-      // Criar nova
-      await fetch('/api/notifications', {
+  for (const n of active) {
+    try {
+      const msg = formatMsg(n, tx);
+      await fetch(n.url, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(data)
+        body: JSON.stringify(msg)
       });
-      showToast('✅ Notificação salva');
+      console.log(`✅ Notificação enviada: ${n.name}`);
+    } catch (err) {
+      console.error(`❌ Erro ao enviar notificação: ${err.message}`);
     }
+  }
+}
+
+function formatMsg(notif, tx) {
+  const vars = {
+    '{VALOR}': `R$ ${((tx.amount||0)/100).toFixed(2)}`,
+    '{CLIENTE}': tx.customer?.name || 'Cliente',
+    '{EMAIL}': tx.customer?.email || '',
+    '{DOCUMENTO}': tx.customer?.document || '',
+    '{METODO}': tx.paymentMethod || '',
+    '{ID}': tx.id || '',
+    '{DATA}': new Date().toLocaleString('pt-BR'),
+    '{PARCELAS}': tx.installments || '1'
+  };
+
+  let title = notif.title;
+  let text = notif.text;
+  Object.entries(vars).forEach(([k,v]) => {
+    title = title.replace(new RegExp(k, 'g'), v);
+    text = text.replace(new RegExp(k, 'g'), v);
+  });
+
+  return {title, text};
+}
+
+// ===== API =====
+
+const app = express();
+app.use(express.json());
+app.use(express.static('public'));
+
+app.get('/api/products', async (req, res) => {
+  try {
+    const txs = await fetchAllTransactions();
+    const products = new Set();
     
-    editingNotificationId = null;
-    document.querySelector('#notification-modal .modal-header h3').textContent = 'Nova Notificação';
-    closeNotificationModal();
-    loadNotifications();
-  } catch (error) {
-    showToast('❌ Erro ao salvar');
+    txs.forEach(t => {
+      if (t.items && t.items[0] && t.items[0].title) {
+        const productType = t.items[0].title.split(' - ')[0].trim();
+        products.add(productType);
+      }
+    });
+    
+    res.json(Array.from(products).sort());
+  } catch (err) {
+    res.status(500).json({error: err.message});
   }
 });
 
-async function toggleNotification(id) {
+app.get('/api/dashboard', async (req, res) => {
   try {
-    const response = await fetch(`/api/notifications/${id}/toggle`, {method: 'POST'});
-    if (response.ok) {
-      loadNotifications();
-      showToast('✅ Status atualizado');
-    }
-  } catch (error) {
-    showToast('❌ Erro ao atualizar');
+    let txs = await fetchAllTransactions();
+    txs = applyFilters(txs, req.query);
+    res.json(analyzeDashboard(txs));
+  } catch (err) {
+    res.status(500).json({error: err.message});
   }
-}
+});
 
-async function testNotification(id) {
+app.get('/api/pix', async (req, res) => {
   try {
-    const response = await fetch(`/api/notifications/${id}/test`, {method: 'POST'});
-    if (response.ok) {
-      showToast('✅ Notificação de teste enviada!');
-    } else {
-      showToast('❌ Erro ao enviar teste');
-    }
-  } catch (error) {
-    showToast('❌ Erro ao enviar teste');
+    let txs = await fetchAllTransactions();
+    txs = applyFilters(txs, {...req.query, paymentMethod: 'pix'});
+    res.json(analyzePIX(txs));
+  } catch (err) {
+    res.status(500).json({error: err.message});
   }
-}
+});
 
-async function deleteNotification(id) {
-  if (!confirm('Tem certeza que deseja excluir esta notificação?')) return;
-  
+app.get('/api/products-sold-today', async (req, res) => {
   try {
-    await fetch(`/api/notifications/${id}`, {method: 'DELETE'});
-    loadNotifications();
-    showToast('✅ Notificação excluída');
-  } catch (error) {
-    showToast('❌ Erro ao excluir');
+    const { startDate, endDate } = req.query;
+    const txs = await fetchAllTransactions();
+    const products = analyzeProductsSoldByDate(txs, startDate || null, endDate || null);
+    res.json(products);
+  } catch (err) {
+    res.status(500).json({error: err.message});
   }
-}
+});
 
-// ===== EXPORTAÇÃO =====
-function exportCSV() {
-  const query = buildQueryString();
-  window.open(`/api/export/csv?${query}`, '_blank');
-}
+app.get('/api/transactions', async (req, res) => {
+  try {
+    let allTxs = await fetchAllTransactions();
+    allTxs = applyFilters(allTxs, req.query);
+    
+    const page = parseInt(req.query.page) || 1;
+    const pageSize = parseInt(req.query.pageSize) || 50;
+    const start = (page - 1) * pageSize;
+    const end = start + pageSize;
+    
+    const paginatedTxs = allTxs.slice(start, end);
+    
+    res.json({
+      data: paginatedTxs,
+      pagination: {
+        page,
+        pageSize,
+        totalRecords: allTxs.length,
+        totalPages: Math.ceil(allTxs.length / pageSize)
+      }
+    });
+  } catch (err) {
+    res.status(500).json({error: err.message});
+  }
+});
 
-function exportExcel() {
-  const query = buildQueryString();
-  window.open(`/api/export/excel?${query}`, '_blank');
-}
+app.get('/api/sales', async (req, res) => {
+  try {
+    let allTxs = await fetchAllTransactions();
+    allTxs = applyFilters(allTxs, req.query);
+    
+    const sales = allTxs
+      .filter(t => t.status === 'paid')
+      .map(t => ({
+        id: t.id,
+        date: t.createdAt,
+        customer: t.customer?.name || 'N/A',
+        email: t.customer?.email || 'N/A',
+        document: t.customer?.document?.number || 'N/A',
+        product: t.items?.[0]?.title || 'N/A',
+        amount: (t.amount || 0) / 100,
+        netAmount: (t.fee?.netAmount || 0) / 100,
+        fee: ((t.amount || 0) - (t.fee?.netAmount || 0)) / 100,
+        method: t.paymentMethod || 'N/A',
+        installments: t.installments || 1
+      }));
+    
+    res.json(sales);
+  } catch (err) {
+    res.status(500).json({error: err.message});
+  }
+});
 
-function exportTXT() {
-  const query = buildQueryString();
-  window.open(`/api/export/txt?${query}`, '_blank');
-}
+app.get('/api/leads', async (req, res) => {
+  try {
+    let allTxs = await fetchAllTransactions();
+    allTxs = applyFilters(allTxs, req.query);
+    
+    const leadsMap = {};
+    
+    allTxs.forEach(t => {
+      const doc = t.customer?.document?.number;
+      if (!doc) return;
+      
+      if (!leadsMap[doc]) {
+        leadsMap[doc] = {
+          document: doc,
+          name: t.customer?.name || 'N/A',
+          email: t.customer?.email || 'N/A',
+          phone: t.customer?.phone || 'N/A',
+          firstPurchase: t.createdAt,
+          lastPurchase: t.createdAt,
+          totalPurchases: 0,
+          paidPurchases: 0,
+          totalSpent: 0,
+          products: new Set()
+        };
+      }
+      
+      const lead = leadsMap[doc];
+      lead.totalPurchases++;
+      
+      if (t.status === 'paid') {
+        lead.paidPurchases++;
+        lead.totalSpent += (t.amount || 0) / 100;
+      }
+      
+      if (new Date(t.createdAt) < new Date(lead.firstPurchase)) {
+        lead.firstPurchase = t.createdAt;
+      }
+      if (new Date(t.createdAt) > new Date(lead.lastPurchase)) {
+        lead.lastPurchase = t.createdAt;
+      }
+      
+      if (t.items?.[0]?.title) {
+        const productType = t.items[0].title.split(' - ')[0].trim();
+        lead.products.add(productType);
+      }
+    });
+    
+    const leads = Object.values(leadsMap).map(l => ({
+      ...l,
+      products: Array.from(l.products).join(', ')
+    }));
+    
+    res.json(leads);
+  } catch (err) {
+    res.status(500).json({error: err.message});
+  }
+});
 
-// ===== UTILS =====
-function formatMoney(value) {
-  return 'R$ ' + (value || 0).toFixed(2).replace('.', ',');
-}
+// Notificações
+app.get('/api/notifications', (req, res) => {
+  res.json(notifications);
+});
 
-function showToast(message) {
-  const toast = document.createElement('div');
-  toast.textContent = message;
-  toast.style.cssText = `
-    position: fixed;
-    top: 20px;
-    right: 20px;
-    background: var(--bg-card);
-    color: var(--text-primary);
-    padding: 12px 20px;
-    border-radius: 8px;
-    border: 1px solid var(--border);
-    box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-    z-index: 10000;
-    animation: slideIn 0.3s ease;
-  `;
+app.post('/api/notifications', async (req, res) => {
+  const notif = {
+    id: Date.now().toString(),
+    enabled: true,
+    ...req.body
+  };
+  notifications.push(notif);
+  await saveFile(FILES.notifications, notifications);
+  res.json(notif);
+});
+
+app.put('/api/notifications/:id', async (req, res) => {
+  const idx = notifications.findIndex(n => n.id === req.params.id);
+  if (idx === -1) return res.status(404).json({error: 'Not found'});
   
-  document.body.appendChild(toast);
+  notifications[idx] = {...notifications[idx], ...req.body};
+  await saveFile(FILES.notifications, notifications);
+  res.json(notifications[idx]);
+});
+
+app.delete('/api/notifications/:id', async (req, res) => {
+  notifications = notifications.filter(n => n.id !== req.params.id);
+  await saveFile(FILES.notifications, notifications);
+  res.json({success: true});
+});
+
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    cache: isCacheValid() ? 'valid' : 'expired',
+    transactions: transactionsCache.data?.length || 0
+  });
+});
+
+// Endpoint para forçar refresh do cache
+app.post('/api/refresh', async (req, res) => {
+  try {
+    console.log('🔄 Forçando atualização do cache...');
+    const txs = await fetchAllTransactions(true);
+    res.json({ success: true, transactions: txs.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ===== INICIALIZAÇÃO =====
+
+async function init() {
+  notifications = await loadFile(FILES.notifications);
+  const processed = await loadFile(FILES.processed);
+  processedEvents = new Set(processed);
+
+  console.log('\n🚀 DHR Analytics PRO');
+  console.log(`📍 http://localhost:${CONFIG.PORT}`);
+  console.log(`💾 Cache TTL: ${CONFIG.CACHE_TTL / 1000}s`);
+  console.log(`🔄 Retry: ${CONFIG.MAX_RETRIES} tentativas\n`);
+
+  app.listen(CONFIG.PORT, () => {
+    console.log(`✅ Servidor rodando na porta ${CONFIG.PORT}`);
+  });
   
-  setTimeout(() => {
-    toast.style.animation = 'slideOut 0.3s ease';
-    setTimeout(() => toast.remove(), 300);
-  }, 3000);
+  // Buscar dados iniciais
+  try {
+    await fetchAllTransactions();
+  } catch (err) {
+    console.error('⚠️  Erro ao buscar dados iniciais:', err.message);
+  }
+  
+  // Iniciar verificação de eventos
+  setInterval(checkEvents, CONFIG.CHECK_INTERVAL);
 }
+
+init();

@@ -918,9 +918,30 @@
         </div>
       </div>
 
-      <!-- PRODUTOS VENDIDOS HOJE -->
+      <!-- PRODUTOS VENDIDOS POR DATA -->
       <div class="card">
-        <h3 class="card-title">🛍️ Produtos Vendidos Hoje</h3>
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 15px; margin-bottom: 15px;">
+          <h3 class="card-title" style="margin-bottom: 0;">🛍️ Produtos Vendidos</h3>
+          <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <label style="font-size: 13px; color: var(--text-secondary);">De:</label>
+              <input type="date" id="products-start-date" class="filter-input" style="padding: 8px 10px; font-size: 13px;">
+            </div>
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <label style="font-size: 13px; color: var(--text-secondary);">Até:</label>
+              <input type="date" id="products-end-date" class="filter-input" style="padding: 8px 10px; font-size: 13px;">
+            </div>
+            <button class="btn btn-primary btn-sm" onclick="loadProductsSoldByDate()" style="padding: 8px 16px;">
+              🔍 Filtrar
+            </button>
+            <button class="btn btn-secondary btn-sm" onclick="loadProductsSoldToday()" style="padding: 8px 16px;">
+              📅 Hoje
+            </button>
+          </div>
+        </div>
+        <div id="products-date-label" style="font-size: 13px; color: var(--text-muted); margin-bottom: 10px;">
+          Mostrando vendas de hoje
+        </div>
         <div id="products-sold-container">
           <div style="padding: 20px; text-align: center; color: var(--text-muted);">
             Carregando produtos...

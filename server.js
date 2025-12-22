@@ -14,7 +14,7 @@ const CONFIG = {
   DHR_API_URL: 'https://api.dhrtecnologialtda.com/v1',
   CHECK_INTERVAL: 5000,
   PORT: process.env.PORT || 3005,
-  CACHE_TTL: 60000, // Cache de 1 minuto
+  CACHE_TTL: 300000, // Cache de 5 minutos para carregar mais rapido
   MAX_RETRIES: 3,
   RETRY_DELAY: 2000 // 2 segundos entre retries
 };
@@ -99,11 +99,55 @@ async function fetchAllTransactions(forceRefresh = false) {
 
   let allTransactions = [];
   let page = 1;
-  const pageSize = 200;
+  const pageSize = 500; // Aumentado para menos requisicoes
   let totalPages = null;
   
   console.log('🔄 Buscando todas as transações da API...');
   
+  // Primeira requisicao para descobrir total de paginas
+  try {
+    const firstData = await fetchDHR(`/transactions?page=1&pageSize=${pageSize}`);
+    const firstTransactions = firstData.data || [];
+    const pagination = firstData.pagination || {};
+    
+    totalPages = pagination.totalPages || 1;
+    console.log(`  📊 Total de registros: ${pagination.totalRecords} (${totalPages} paginas)`);
+    
+    allTransactions = [...firstTransactions];
+    
+    if (totalPages <= 1) {
+      // Apenas 1 pagina, ja temos tudo
+      console.log('  ✅ Apenas 1 pagina, dados completos');
+    } else {
+      // Buscar demais paginas em PARALELO (maximo 5 de cada vez)
+      const remainingPages = [];
+      for (let p = 2; p <= totalPages; p++) {
+        remainingPages.push(p);
+      }
+      
+      // Processar em lotes de 5 paginas simultaneas
+      const batchSize = 5;
+      for (let i = 0; i < remainingPages.length; i += batchSize) {
+        const batch = remainingPages.slice(i, i + batchSize);
+        const promises = batch.map(p => fetchDHR(`/transactions?page=${p}&pageSize=${pageSize}`));
+        
+        const results = await Promise.all(promises);
+        results.forEach(data => {
+          if (data.data) {
+            allTransactions = allTransactions.concat(data.data);
+          }
+        });
+        
+        console.log(`  📥 Carregadas paginas ${batch[0]}-${batch[batch.length-1]} de ${totalPages}`);
+      }
+    }
+  } catch (err) {
+    console.error('Erro ao buscar transacoes:', err.message);
+    throw err;
+  }
+  
+  // Codigo antigo comentado - busca sequencial
+  /*
   while (true) {
     try {
       const data = await fetchDHR(`/transactions?page=${page}&pageSize=${pageSize}`);
@@ -145,6 +189,7 @@ async function fetchAllTransactions(forceRefresh = false) {
       break;
     }
   }
+  */
   
   console.log(`✅ Total de transações buscadas: ${allTransactions.length}`);
   

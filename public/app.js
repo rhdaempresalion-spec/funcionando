@@ -1,3 +1,6 @@
+// ===== DHR ANALYTICS PRO - ULTRA FAST =====
+// Versão otimizada com cache local e filtros instantâneos
+
 // ===== ESTADO GLOBAL =====
 let currentFilters = {
   startDate: '',
@@ -22,24 +25,427 @@ let charts = {
   amounts: null
 };
 
+// ===== CACHE LOCAL DE TRANSAÇÕES =====
+let localCache = {
+  transactions: [],
+  timestamp: 0,
+  isLoading: false,
+  products: []
+};
+
 // ===== INICIALIZAÇÃO =====
 document.addEventListener('DOMContentLoaded', () => {
   setupTabs();
   setupFilters();
+  
+  // Carregar dados iniciais
+  initializeData();
+  
+  // Atualizar cache em background a cada 10 segundos (tempo real)
+  setInterval(refreshCacheBackground, 10000);
+  
+  // Mostrar indicador de última atualização
+  updateCacheIndicator();
+  setInterval(updateCacheIndicator, 5000);
+});
+
+async function initializeData() {
+  await loadAllTransactions();
+  
+  // Se não carregou dados, tentar novamente em 2 segundos
+  if (localCache.transactions.length === 0) {
+    showToast('⏳ Servidor carregando dados, aguarde...');
+    setTimeout(async () => {
+      await loadAllTransactions();
+      if (localCache.transactions.length === 0) {
+        // Tentar mais uma vez
+        setTimeout(initializeData, 3000);
+      } else {
+        finishInitialization();
+      }
+    }, 2000);
+  } else {
+    finishInitialization();
+  }
+}
+
+function finishInitialization() {
   loadProducts();
-  loadDashboard();
+  applyFiltersInstant();
   loadNotifications();
   loadAnalysisData();
+}
+
+// ===== CACHE LOCAL =====
+async function loadAllTransactions() {
+  if (localCache.isLoading) return;
   
-  // Auto-refresh DESATIVADO - atualização manual via botão
-  // Para reativar, descomente o código abaixo:
-  // setInterval(() => {
-  //   const activeTab = document.querySelector('.tab.active')?.dataset.tab;
-  //   if (activeTab === 'dashboard') loadDashboard();
-  //   if (activeTab === 'pix') loadPIX();
-  //   if (activeTab === 'analysis') updateAnalysis();
-  // }, 30000); // 30 segundos
-});
+  localCache.isLoading = true;
+  showLoadingIndicator(true);
+  
+  try {
+    const startTime = Date.now();
+    const response = await fetch('/api/all-transactions');
+    const data = await response.json();
+    const loadTime = Date.now() - startTime;
+    
+    localCache.transactions = data.data || [];
+    localCache.timestamp = data.cacheTimestamp || Date.now();
+    
+    // Extrair produtos únicos
+    const products = new Set();
+    localCache.transactions.forEach(t => {
+      if (t.items && t.items[0] && t.items[0].title) {
+        const productType = t.items[0].title.split(' - ')[0].trim();
+        products.add(productType);
+      }
+    });
+    localCache.products = Array.from(products).sort();
+    
+    console.log(`✅ Cache local: ${localCache.transactions.length} transações em ${loadTime}ms`);
+    
+    if (localCache.transactions.length > 0) {
+      showToast(`⚡ ${localCache.transactions.length.toLocaleString()} transações em ${loadTime}ms`);
+    } else {
+      showToast('⏳ Aguardando dados do servidor...');
+    }
+    
+  } catch (error) {
+    console.error('Erro ao carregar transações:', error);
+    showToast('❌ Erro ao carregar dados');
+  } finally {
+    localCache.isLoading = false;
+    showLoadingIndicator(false);
+  }
+}
+
+async function refreshCacheBackground() {
+  if (localCache.isLoading) return;
+  
+  try {
+    const response = await fetch('/api/all-transactions');
+    const data = await response.json();
+    
+    const newCount = (data.data || []).length;
+    const oldCount = localCache.transactions.length;
+    
+    localCache.transactions = data.data || [];
+    localCache.timestamp = data.cacheTimestamp || Date.now();
+    
+    // Atualizar produtos
+    const products = new Set();
+    localCache.transactions.forEach(t => {
+      if (t.items && t.items[0] && t.items[0].title) {
+        const productType = t.items[0].title.split(' - ')[0].trim();
+        products.add(productType);
+      }
+    });
+    localCache.products = Array.from(products).sort();
+    
+    // Se houve mudança, atualizar dashboard
+    if (newCount !== oldCount) {
+      console.log(`🔄 Cache atualizado: ${oldCount} → ${newCount} transações`);
+      applyFiltersInstant();
+    }
+    
+    updateCacheIndicator();
+    
+  } catch (error) {
+    console.error('Erro ao atualizar cache:', error);
+  }
+}
+
+function updateCacheIndicator() {
+  const indicator = document.getElementById('cache-indicator');
+  if (!indicator) return;
+  
+  const age = Date.now() - localCache.timestamp;
+  const seconds = Math.floor(age / 1000);
+  
+  if (seconds < 60) {
+    indicator.textContent = `Atualizado há ${seconds}s`;
+  } else {
+    const minutes = Math.floor(seconds / 60);
+    indicator.textContent = `Atualizado há ${minutes}min`;
+  }
+}
+
+function showLoadingIndicator(show) {
+  const indicator = document.getElementById('loading-indicator');
+  if (indicator) {
+    indicator.style.display = show ? 'block' : 'none';
+  }
+}
+
+// ===== FILTROS LOCAIS (INSTANTÂNEOS) =====
+function applyFiltersLocal(transactions) {
+  let result = [...transactions];
+
+  if (currentFilters.startDate) {
+    const start = new Date(currentFilters.startDate + 'T00:00:00-03:00').getTime();
+    result = result.filter(t => new Date(t.createdAt).getTime() >= start);
+  }
+
+  if (currentFilters.endDate) {
+    const end = new Date(currentFilters.endDate + 'T23:59:59-03:00').getTime();
+    result = result.filter(t => new Date(t.createdAt).getTime() <= end);
+  }
+
+  if (currentFilters.status === 'paid') {
+    result = result.filter(t => t.status === 'paid');
+  } else if (currentFilters.status === 'pending') {
+    result = result.filter(t => ['waiting_payment', 'pending'].includes(t.status));
+  }
+
+  if (currentFilters.paymentMethod && currentFilters.paymentMethod !== 'all') {
+    result = result.filter(t => t.paymentMethod === currentFilters.paymentMethod);
+  }
+
+  if (currentFilters.products && currentFilters.products.length > 0) {
+    result = result.filter(t => {
+      if (!t.items || !t.items[0]) return false;
+      const productType = t.items[0].title.split(' - ')[0].trim();
+      return currentFilters.products.includes(productType);
+    });
+  }
+
+  return result;
+}
+
+// ===== ANÁLISES LOCAIS =====
+function analyzeDashboardLocal(transactions) {
+  const uniqueLeads = new Set();
+  transactions.forEach(t => {
+    if (t.customer && t.customer.document && t.customer.document.number) {
+      uniqueLeads.add(t.customer.document.number);
+    }
+  });
+  const totalLeads = uniqueLeads.size;
+
+  const calc = (txs) => {
+    const paid = txs.filter(t => t.status === 'paid');
+    const pending = txs.filter(t => ['waiting_payment','pending'].includes(t.status));
+    const paidAmount = paid.reduce((s,t) => s + (t.amount||0), 0) / 100;
+    const netAmount = paid.reduce((s,t) => s + (t.fee?.netAmount||0), 0) / 100;
+    const estimatedFee = paidAmount - netAmount;
+    const refundedAmount = txs.reduce((s,t) => s + (t.refundedAmount||0), 0) / 100;
+    
+    return {
+      total: txs.length,
+      paid: paid.length,
+      pending: pending.length,
+      paidAmount,
+      pendingAmount: pending.reduce((s,t) => s + (t.amount||0), 0) / 100,
+      totalAmount: txs.reduce((s,t) => s + (t.amount||0), 0) / 100,
+      avgTicket: paid.length ? paid.reduce((s,t) => s + (t.amount||0), 0) / paid.length / 100 : 0,
+      conversion: txs.length ? (paid.length / txs.length * 100).toFixed(1) : 0,
+      netAmount,
+      estimatedFee,
+      refundedAmount
+    };
+  };
+
+  const hourly = Array(24).fill(0).map(() => ({sales:0, amount:0}));
+  transactions.filter(t => t.status === 'paid').forEach(t => {
+    const date = new Date(t.createdAt);
+    const utcHour = date.getUTCHours();
+    const spHour = (utcHour - 3 + 24) % 24;
+    hourly[spHour].sales++;
+    hourly[spHour].amount += (t.amount||0) / 100;
+  });
+
+  const bestHour = hourly.reduce((best, curr, idx) => 
+    curr.sales > hourly[best].sales ? idx : best, 0);
+
+  const weekdays = ['Dom','Seg','Ter','Qua','Qui','Sex','Sáb'];
+  const byWeekday = weekdays.map(d => ({day:d, sales:0, amount:0}));
+  transactions.filter(t => t.status === 'paid').forEach(t => {
+    const date = new Date(t.createdAt);
+    const spDate = new Date(date.getTime() - 3 * 60 * 60 * 1000);
+    const d = spDate.getUTCDay();
+    byWeekday[d].sales++;
+    byWeekday[d].amount += (t.amount||0) / 100;
+  });
+
+  const allTxs = transactions;
+  const latestDate = allTxs.length > 0 
+    ? Math.max(...allTxs.map(t => new Date(t.createdAt).getTime()))
+    : Date.now();
+  
+  const weekAgo = new Date(latestDate - 7*86400000);
+  const monthAgo = new Date(latestDate - 30*86400000);
+  
+  const weekTxs = allTxs.filter(t => new Date(t.createdAt) >= weekAgo);
+  const monthTxs = allTxs.filter(t => new Date(t.createdAt) >= monthAgo);
+
+  return {
+    period: calc(transactions),
+    today: calc(transactions), // Compatibilidade
+    week: calc(weekTxs),
+    month: calc(monthTxs),
+    hourly,
+    bestHour: `${bestHour}:00`,
+    weekdayStats: byWeekday,
+    totalLeads: totalLeads
+  };
+}
+
+function analyzeProductsSoldLocal(transactions, startDate = null, endDate = null) {
+  let dayStartBrazil, dayEndBrazil;
+  
+  if (startDate) {
+    const [year, month, day] = startDate.split('-').map(Number);
+    dayStartBrazil = new Date(Date.UTC(year, month - 1, day, 3, 0, 0, 0));
+  } else {
+    const now = new Date();
+    const nowUTC = now.getTime();
+    const brazilNow = new Date(nowUTC - (3 * 60 * 60 * 1000));
+    dayStartBrazil = new Date(Date.UTC(
+      brazilNow.getUTCFullYear(),
+      brazilNow.getUTCMonth(), 
+      brazilNow.getUTCDate(),
+      3, 0, 0, 0
+    ));
+  }
+  
+  if (endDate) {
+    const [year, month, day] = endDate.split('-').map(Number);
+    dayEndBrazil = new Date(Date.UTC(year, month - 1, day, 3 + 23, 59, 59, 999));
+  } else if (startDate) {
+    const [year, month, day] = startDate.split('-').map(Number);
+    dayEndBrazil = new Date(Date.UTC(year, month - 1, day, 3 + 23, 59, 59, 999));
+  } else {
+    const now = new Date();
+    const nowUTC = now.getTime();
+    const brazilNow = new Date(nowUTC - (3 * 60 * 60 * 1000));
+    dayEndBrazil = new Date(Date.UTC(
+      brazilNow.getUTCFullYear(),
+      brazilNow.getUTCMonth(),
+      brazilNow.getUTCDate(),
+      3 + 23, 59, 59, 999
+    ));
+  }
+  
+  const filteredTxs = transactions.filter(t => {
+    const txTime = new Date(t.createdAt).getTime();
+    return txTime >= dayStartBrazil.getTime() && txTime <= dayEndBrazil.getTime();
+  });
+  
+  const productMap = {};
+  
+  filteredTxs.forEach(t => {
+    if (t.items && t.items[0] && t.items[0].title) {
+      let productName = t.items[0].title;
+      productName = productName.replace(/\s*-\s*Placa\s+[A-Z0-9]+/i, '');
+      
+      const quantity = t.items[0].quantity || 1;
+      const amount = (t.amount || 0) / 100;
+      
+      if (!productMap[productName]) {
+        productMap[productName] = {
+          name: productName,
+          totalSales: 0,
+          totalQuantity: 0,
+          totalAmount: 0,
+          paidSales: 0,
+          paidAmount: 0,
+          paidNetAmount: 0,
+          pendingSales: 0,
+          pendingAmount: 0
+        };
+      }
+      
+      productMap[productName].totalSales++;
+      productMap[productName].totalQuantity += quantity;
+      productMap[productName].totalAmount += amount;
+      
+      if (t.status === 'paid') {
+        const netAmount = (t.fee?.netAmount || 0) / 100;
+        productMap[productName].paidSales++;
+        productMap[productName].paidAmount += amount;
+        productMap[productName].paidNetAmount += netAmount;
+      } else if (['waiting_payment', 'pending'].includes(t.status)) {
+        productMap[productName].pendingSales++;
+        productMap[productName].pendingAmount += amount;
+      }
+    }
+  });
+  
+  return Object.values(productMap)
+    .map(p => ({
+      ...p,
+      avgTicket: p.paidSales > 0 ? (p.paidAmount / p.paidSales).toFixed(2) : '0.00',
+      avgNetTicket: p.paidSales > 0 ? (p.paidNetAmount / p.paidSales).toFixed(2) : '0.00'
+    }))
+    .filter(p => p.paidSales > 0)
+    .sort((a, b) => b.paidNetAmount - a.paidNetAmount);
+}
+
+function analyzePIXLocal(transactions) {
+  const pixTxs = transactions.filter(t => t.paymentMethod === 'pix');
+  const paid = pixTxs.filter(t => t.status === 'paid');
+  const pending = pixTxs.filter(t => ['waiting_payment','pending'].includes(t.status));
+
+  const merchantMap = {};
+  pixTxs.forEach(t => {
+    // Simplificado - usar nome do cliente como merchant
+    const name = t.customer?.name || 'Desconhecido';
+    
+    if (!merchantMap[name]) {
+      merchantMap[name] = {
+        name,
+        merchant: name,
+        acquirer: 'PIX',
+        total: 0,
+        paid: 0,
+        pending: 0,
+        amount: 0
+      };
+    }
+    merchantMap[name].total++;
+    if (t.status === 'paid') {
+      merchantMap[name].paid++;
+      merchantMap[name].amount += (t.amount||0) / 100;
+    } else if (['waiting_payment','pending'].includes(t.status)) {
+      merchantMap[name].pending++;
+    }
+  });
+
+  const ranking = Object.values(merchantMap).map(m => ({
+    ...m,
+    conversion: m.total ? (m.paid / m.total * 100).toFixed(1) : 0
+  })).sort((a,b) => b.paid - a.paid);
+
+  const amounts = {};
+  pixTxs.forEach(t => {
+    const amt = ((t.amount||0)/100).toFixed(2);
+    amounts[amt] = (amounts[amt]||0) + 1;
+  });
+
+  const topAmounts = Object.entries(amounts)
+    .map(([amt, cnt]) => ({amount:parseFloat(amt), count:cnt}))
+    .sort((a,b) => b.count - a.count)
+    .slice(0,10);
+
+  let avgTime = 0;
+  if (paid.length) {
+    const times = paid.filter(t => t.updatedAt).map(t => 
+      new Date(t.updatedAt) - new Date(t.createdAt)
+    );
+    if (times.length) avgTime = times.reduce((s,t) => s+t, 0) / times.length / 60000;
+  }
+
+  return {
+    total: pixTxs.length,
+    paid: paid.length,
+    pending: pending.length,
+    uniqueMerchants: Object.keys(merchantMap).length,
+    conversionRate: pixTxs.length ? (paid.length / pixTxs.length * 100).toFixed(1) : 0,
+    avgPaymentTime: avgTime.toFixed(1) + ' min',
+    ranking: ranking,
+    topValues: topAmounts.map(a => ({value: a.amount, count: a.count}))
+  };
+}
 
 // ===== TABS =====
 function setupTabs() {
@@ -47,20 +453,18 @@ function setupTabs() {
     tab.addEventListener('click', () => {
       const tabName = tab.dataset.tab;
       
-      // Ativar tab
       document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
       tab.classList.add('active');
       
-      // Mostrar conteúdo
       document.querySelectorAll('.tab-content').forEach(c => c.classList.add('hidden'));
       document.getElementById(`tab-${tabName}`).classList.remove('hidden');
       
-      // Carregar dados
-      if (tabName === 'dashboard') loadDashboard();
-      if (tabName === 'pix') loadPIX();
+      // Carregar dados instantaneamente do cache local
+      if (tabName === 'dashboard') applyFiltersInstant();
+      if (tabName === 'pix') loadPIXInstant();
       if (tabName === 'analysis') {
         updateAnalysis();
-        setTimeout(() => calculateAnalysis(), 200);
+        setTimeout(() => calculateAnalysis(), 100);
       }
       if (tabName === 'notifications') loadNotifications();
     });
@@ -68,25 +472,18 @@ function setupTabs() {
 }
 
 // ===== PRODUTOS =====
-async function loadProducts() {
-  try {
-    const response = await fetch('/api/products');
-    const products = await response.json();
-    
-    const select = document.getElementById('filter-products');
-    if (!select) return;
-    
-    select.innerHTML = '<option value="all">Todos</option>';
-    
-    products.forEach(p => {
-      const option = document.createElement('option');
-      option.value = p;
-      option.textContent = p;
-      select.appendChild(option);
-    });
-  } catch (error) {
-    console.error('Erro ao carregar produtos:', error);
-  }
+function loadProducts() {
+  const select = document.getElementById('filter-products');
+  if (!select) return;
+  
+  select.innerHTML = '<option value="all">Todos</option>';
+  
+  localCache.products.forEach(p => {
+    const option = document.createElement('option');
+    option.value = p;
+    option.textContent = p;
+    select.appendChild(option);
+  });
 }
 
 // ===== FILTROS =====
@@ -100,7 +497,6 @@ function applyFilters() {
   const status = document.getElementById('filter-status').value;
   const method = document.getElementById('filter-method').value;
   
-  // Pegar produtos selecionados
   const productsSelect = document.getElementById('filter-products');
   const selectedProducts = productsSelect ? Array.from(productsSelect.selectedOptions).map(opt => opt.value) : [];
   
@@ -112,8 +508,22 @@ function applyFilters() {
     products: selectedProducts.includes('all') ? [] : selectedProducts
   };
   
-  loadDashboard();
+  // INSTANTÂNEO - sem requisição ao servidor!
+  applyFiltersInstant();
   showToast('✅ Filtros aplicados');
+}
+
+function applyFiltersInstant() {
+  // Filtrar localmente - INSTANTÂNEO!
+  const filtered = applyFiltersLocal(localCache.transactions);
+  
+  // Analisar localmente
+  dashboardData = analyzeDashboardLocal(filtered);
+  
+  // Atualizar UI
+  updateDashboardCards(dashboardData);
+  updateCharts(dashboardData);
+  loadProductsSoldInstant();
 }
 
 function clearFilters() {
@@ -137,7 +547,7 @@ function clearFilters() {
     products: []
   };
   
-  loadDashboard();
+  applyFiltersInstant();
   showToast('🔄 Filtros limpos');
 }
 
@@ -155,33 +565,14 @@ function buildQueryString() {
 
 // ===== DASHBOARD =====
 async function loadDashboard() {
-  try {
-    const query = buildQueryString();
-    const response = await fetch(`/api/dashboard?${query}`);
-    const data = await response.json();
-    
-    dashboardData = data;
-    updateDashboardCards(data);
-    updateCharts(data);
-    loadProductsSoldToday();
-    
-    // Atualizar análise se a aba estiver ativa
-    const activeTab = document.querySelector('.tab.active')?.dataset.tab;
-    if (activeTab === 'analysis') {
-      calculateAnalysis();
-    }
-  } catch (error) {
-    console.error('Erro ao carregar dashboard:', error);
-    showToast('❌ Erro ao carregar dados');
-  }
+  // Usar cache local
+  applyFiltersInstant();
 }
 
-async function loadProductsSoldToday() {
-  // USA OS MESMOS FILTROS DO DASHBOARD PRINCIPAL
+function loadProductsSoldInstant() {
   const startDate = currentFilters.startDate || new Date().toISOString().split('T')[0];
   const endDate = currentFilters.endDate || startDate;
   
-  // Atualiza o label com o periodo selecionado
   const label = document.getElementById('products-date-label');
   if (label) {
     if (startDate === endDate) {
@@ -200,102 +591,86 @@ async function loadProductsSoldToday() {
     }
   }
   
-  // Carrega os produtos do periodo selecionado no filtro principal
-  await loadProductsSold(startDate, endDate);
-}
-
-async function loadProductsSold(startDate = null, endDate = null) {
-  try {
-    let url = '/api/products-sold-today';
-    const params = new URLSearchParams();
-    
-    if (startDate) params.append('startDate', startDate);
-    if (endDate) params.append('endDate', endDate);
-    
-    if (params.toString()) {
-      url += '?' + params.toString();
-    }
-    
-    const response = await fetch(url);
-    const products = await response.json();
-    
-    const container = document.getElementById('products-sold-container');
-    if (!container) return;
-    
-    if (products.length === 0) {
-      container.innerHTML = '<div style="padding: 20px; text-align: center; color: var(--text-muted);">Nenhum produto vendido no período selecionado</div>';
-      return;
-    }
-    
-    let html = '<div class="table-container"><table>';
-    html += '<thead><tr>';
-    html += '<th>Produto</th>';
-    html += '<th style="text-align: center;">Vendas Pagas</th>';
-    html += '<th style="text-align: center;">Quantidade</th>';
-    html += '<th style="text-align: right;">Valor Líquido Recebido</th>';
-    html += '<th style="text-align: right;">Ticket Médio Líquido</th>';
-    html += '</tr></thead><tbody>';
-    
-    products.forEach(product => {
-      html += '<tr>';
-      html += `<td><strong>${product.name}</strong></td>`;
-      html += `<td style="text-align: center;">`;
-      html += `<span class="badge badge-success">${product.paidSales}</span>`;
-      html += `</td>`;
-      html += `<td style="text-align: center;">${product.paidSales}x</td>`;
-      html += `<td style="text-align: right;"><strong>${formatMoney(product.paidNetAmount)}</strong></td>`;
-      html += `<td style="text-align: right;">${formatMoney(parseFloat(product.avgNetTicket))}</td>`;
-      html += '</tr>';
-    });
-    
-    html += '</tbody></table></div>';
-    container.innerHTML = html;
-  } catch (error) {
-    console.error('Erro ao carregar produtos vendidos:', error);
-    const container = document.getElementById('products-sold-container');
-    if (container) {
-      container.innerHTML = '<div style="padding: 20px; text-align: center; color: var(--danger);">Erro ao carregar produtos</div>';
-    }
+  // Analisar localmente
+  const products = analyzeProductsSoldLocal(localCache.transactions, startDate, endDate);
+  
+  const container = document.getElementById('products-sold-container');
+  if (!container) return;
+  
+  if (products.length === 0) {
+    container.innerHTML = '<div style="padding: 20px; text-align: center; color: var(--text-muted);">Nenhum produto vendido no período selecionado</div>';
+    return;
   }
+  
+  let html = '<div class="table-container"><table>';
+  html += '<thead><tr>';
+  html += '<th>Produto</th>';
+  html += '<th style="text-align: center;">Vendas Pagas</th>';
+  html += '<th style="text-align: center;">Quantidade</th>';
+  html += '<th style="text-align: right;">Valor Líquido Recebido</th>';
+  html += '<th style="text-align: right;">Ticket Médio Líquido</th>';
+  html += '</tr></thead><tbody>';
+  
+  products.forEach(product => {
+    html += '<tr>';
+    html += `<td><strong>${product.name}</strong></td>`;
+    html += `<td style="text-align: center;">`;
+    html += `<span class="badge badge-success">${product.paidSales}</span>`;
+    html += `</td>`;
+    html += `<td style="text-align: center;">${product.paidSales}x</td>`;
+    html += `<td style="text-align: right;"><strong>${formatMoney(product.paidNetAmount)}</strong></td>`;
+    html += `<td style="text-align: right;">${formatMoney(parseFloat(product.avgNetTicket))}</td>`;
+    html += '</tr>';
+  });
+  
+  html += '</tbody></table></div>';
+  container.innerHTML = html;
 }
 
 function updateDashboardCards(data) {
-  // Usar data.period em vez de data.today (período filtrado)
-  const periodData = data.period || data.today; // Fallback para compatibilidade
+  const periodData = data.period || data.today;
   
-  // Lucro Líquido do Período
-  document.getElementById('net-amount').textContent = formatMoney(periodData.netAmount);
-  const fee = periodData.estimatedFee || 0;
-  document.getElementById('net-subtitle').textContent = `Taxa: ${formatMoney(fee)}`;
+  const netAmountEl = document.getElementById('net-amount');
+  if (netAmountEl) netAmountEl.textContent = formatMoney(periodData.netAmount);
   
-  // Vendas Pagas do Período
-  document.getElementById('today-paid-amount').textContent = formatMoney(periodData.paidAmount);
-  document.getElementById('today-paid-count').textContent = `${periodData.paid} transações`;
+  const netSubtitleEl = document.getElementById('net-subtitle');
+  if (netSubtitleEl) netSubtitleEl.textContent = `Taxa: ${formatMoney(periodData.estimatedFee || 0)}`;
   
-  // Vendas Pendentes do Período
-  document.getElementById('today-pending-amount').textContent = formatMoney(periodData.pendingAmount);
-  document.getElementById('today-pending-count').textContent = `${periodData.pending} transações`;
+  const todayPaidAmountEl = document.getElementById('today-paid-amount');
+  if (todayPaidAmountEl) todayPaidAmountEl.textContent = formatMoney(periodData.paidAmount);
   
-  // Ticket Médio
-  document.getElementById('avg-ticket').textContent = formatMoney(periodData.avgTicket);
+  const todayPaidCountEl = document.getElementById('today-paid-count');
+  if (todayPaidCountEl) todayPaidCountEl.textContent = `${periodData.paid} transações`;
   
-  // Últimos 7 dias (baseado na data final do período)
-  document.getElementById('week-paid-amount').textContent = formatMoney(data.week.paidAmount);
-  document.getElementById('week-paid-count').textContent = `${data.week.paid} transações`;
+  const todayPendingAmountEl = document.getElementById('today-pending-amount');
+  if (todayPendingAmountEl) todayPendingAmountEl.textContent = formatMoney(periodData.pendingAmount);
   
-  // Últimos 30 dias (baseado na data final do período)
-  document.getElementById('month-paid-amount').textContent = formatMoney(data.month.paidAmount);
-  document.getElementById('month-paid-count').textContent = `${data.month.paid} transações`;
+  const todayPendingCountEl = document.getElementById('today-pending-count');
+  if (todayPendingCountEl) todayPendingCountEl.textContent = `${periodData.pending} transações`;
   
-  // Taxa de Conversão
-  document.getElementById('conversion-rate').textContent = periodData.conversion + '%';
+  const avgTicketEl = document.getElementById('avg-ticket');
+  if (avgTicketEl) avgTicketEl.textContent = formatMoney(periodData.avgTicket);
   
-  // Melhor horário
-  document.getElementById('best-hour').textContent = data.bestHour;
+  const weekPaidAmountEl = document.getElementById('week-paid-amount');
+  if (weekPaidAmountEl) weekPaidAmountEl.textContent = formatMoney(data.week.paidAmount);
+  
+  const weekPaidCountEl = document.getElementById('week-paid-count');
+  if (weekPaidCountEl) weekPaidCountEl.textContent = `${data.week.paid} transações`;
+  
+  const monthPaidAmountEl = document.getElementById('month-paid-amount');
+  if (monthPaidAmountEl) monthPaidAmountEl.textContent = formatMoney(data.month.paidAmount);
+  
+  const monthPaidCountEl = document.getElementById('month-paid-count');
+  if (monthPaidCountEl) monthPaidCountEl.textContent = `${data.month.paid} transações`;
+  
+  const conversionRateEl = document.getElementById('conversion-rate');
+  if (conversionRateEl) conversionRateEl.textContent = periodData.conversion + '%';
+  
+  const bestHourEl = document.getElementById('best-hour');
+  if (bestHourEl) bestHourEl.textContent = data.bestHour;
 }
 
 function updateCharts(data) {
-  // Gráfico por hora
   const hourlyCtx = document.getElementById('chart-hourly')?.getContext('2d');
   if (hourlyCtx) {
     if (charts.hourly) charts.hourly.destroy();
@@ -313,17 +688,12 @@ function updateCharts(data) {
       options: {
         responsive: true,
         maintainAspectRatio: false,
-        plugins: {
-          legend: { display: false }
-        },
-        scales: {
-          y: { beginAtZero: true }
-        }
+        plugins: { legend: { display: false } },
+        scales: { y: { beginAtZero: true } }
       }
     });
   }
   
-  // Gráfico por dia da semana
   const weekdayCtx = document.getElementById('chart-weekday')?.getContext('2d');
   if (weekdayCtx) {
     if (charts.weekday) charts.weekday.destroy();
@@ -341,12 +711,8 @@ function updateCharts(data) {
       options: {
         responsive: true,
         maintainAspectRatio: false,
-        plugins: {
-          legend: { display: false }
-        },
-        scales: {
-          y: { beginAtZero: true }
-        }
+        plugins: { legend: { display: false } },
+        scales: { y: { beginAtZero: true } }
       }
     });
   }
@@ -373,29 +739,25 @@ function saveAnalysisData() {
 
 async function updateAnalysis() {
   if (!dashboardData) {
-    await loadDashboard();
+    applyFiltersInstant();
   }
   calculateAnalysis();
 }
 
 function calculateAnalysis() {
-  // Pegar valores dos inputs
   const adSpendInput = document.getElementById('input-ad-spend');
   const leadsInput = document.getElementById('input-leads');
   const chargebackInput = document.getElementById('input-chargeback');
   
-  if (!adSpendInput) return; // Aba não carregada ainda
+  if (!adSpendInput) return;
   
   analysisData.adSpend = parseFloat(adSpendInput.value) || 0;
-  // Leads agora vem do backend (CPFs únicos do período)
   const leadsFromAPI = dashboardData?.totalLeads || 0;
   analysisData.leads = leadsFromAPI;
-  // Chargeback agora vem do backend (refundedAmount do período)
   const periodData = dashboardData?.period || dashboardData?.today || {};
   const chargebackFromAPI = periodData.refundedAmount || 0;
   analysisData.chargeback = chargebackFromAPI;
   
-  // Atualizar campo de leads com valor automático
   if (leadsInput) {
     leadsInput.value = leadsFromAPI;
     leadsInput.disabled = true;
@@ -403,7 +765,6 @@ function calculateAnalysis() {
     leadsInput.style.cursor = 'not-allowed';
   }
   
-  // Atualizar campo de chargeback com valor automático
   if (chargebackInput) {
     chargebackInput.value = chargebackFromAPI.toFixed(2);
     chargebackInput.disabled = true;
@@ -415,13 +776,11 @@ function calculateAnalysis() {
   
   if (!dashboardData) return;
   
-  // Usar dados do período filtrado (periodData já foi declarado acima)
   const revenue = periodData.paidAmount || 0;
   const profit = periodData.netAmount || 0;
   const fees = periodData.estimatedFee || 0;
   const sales = periodData.paid || 0;
   
-  // Atualizar cards principais
   const revenueEl = document.getElementById('analysis-revenue');
   const profitEl = document.getElementById('analysis-profit');
   const feesEl = document.getElementById('analysis-fees');
@@ -430,12 +789,10 @@ function calculateAnalysis() {
   if (profitEl) profitEl.textContent = formatMoney(profit);
   if (feesEl) feesEl.textContent = formatMoney(fees);
   
-  // Calcular métricas
   const adSpend = analysisData.adSpend;
   const leads = analysisData.leads;
   const chargeback = analysisData.chargeback;
   
-  // ROI = ((Lucro - Investimento) / Investimento) * 100
   const roi = adSpend > 0 ? ((profit - adSpend) / adSpend * 100) : 0;
   const roiEl = document.getElementById('metric-roi');
   if (roiEl) {
@@ -443,12 +800,10 @@ function calculateAnalysis() {
     roiEl.style.color = roi >= 0 ? '#10b981' : '#ef4444';
   }
   
-  // ROAS = Receita / Gasto com Anúncios
   const roas = adSpend > 0 ? (revenue / adSpend) : 0;
   const roasEl = document.getElementById('metric-roas');
   if (roasEl) roasEl.textContent = roas.toFixed(2) + 'x';
   
-  // Margem de Lucro = (Lucro Líquido / Receita) * 100
   const margin = revenue > 0 ? ((profit - adSpend - chargeback) / revenue * 100) : 0;
   const marginEl = document.getElementById('metric-margin');
   if (marginEl) {
@@ -456,39 +811,44 @@ function calculateAnalysis() {
     marginEl.style.color = margin >= 0 ? '#10b981' : '#ef4444';
   }
   
-  // Custo por Lead
   const cpl = leads > 0 ? (adSpend / leads) : 0;
   const cplEl = document.getElementById('metric-cpl');
   if (cplEl) cplEl.textContent = formatMoney(cpl);
   
-  // CPA (Custo por Aquisição)
   const cpa = sales > 0 ? (adSpend / sales) : 0;
   const cpaEl = document.getElementById('metric-cpa');
   if (cpaEl) cpaEl.textContent = formatMoney(cpa);
   
-  // Reembolsos
-  const refunded = dashboardData.today.refundedAmount || 0;
+  const refunded = dashboardData?.today?.refundedAmount || 0;
   const lossesEl = document.getElementById('metric-losses');
   if (lossesEl) lossesEl.textContent = formatMoney(refunded);
 }
 
 // ===== PIX =====
-async function loadPIX() {
-  try {
-    const query = buildQueryString();
-    const response = await fetch(`/api/pix?${query}`);
-    const data = await response.json();
-    
-    // Atualizar cards
-    document.getElementById('pix-total').textContent = data.total;
-    document.getElementById('pix-paid').textContent = data.paid;
-    document.getElementById('pix-pending').textContent = data.pending;
-    document.getElementById('pix-merchants').textContent = data.uniqueMerchants;
-    document.getElementById('pix-conversion').textContent = data.conversionRate + '%';
-    document.getElementById('pix-avg-time').textContent = data.avgPaymentTime;
-    
-    // Ranking
-    const rankingContainer = document.getElementById('merchant-ranking');
+function loadPIXInstant() {
+  const filtered = applyFiltersLocal(localCache.transactions);
+  const data = analyzePIXLocal(filtered);
+  
+  const pixTotalEl = document.getElementById('pix-total');
+  if (pixTotalEl) pixTotalEl.textContent = data.total;
+  
+  const pixPaidEl = document.getElementById('pix-paid');
+  if (pixPaidEl) pixPaidEl.textContent = data.paid;
+  
+  const pixPendingEl = document.getElementById('pix-pending');
+  if (pixPendingEl) pixPendingEl.textContent = data.pending;
+  
+  const pixMerchantsEl = document.getElementById('pix-merchants');
+  if (pixMerchantsEl) pixMerchantsEl.textContent = data.uniqueMerchants;
+  
+  const pixConversionEl = document.getElementById('pix-conversion');
+  if (pixConversionEl) pixConversionEl.textContent = data.conversionRate + '%';
+  
+  const pixAvgTimeEl = document.getElementById('pix-avg-time');
+  if (pixAvgTimeEl) pixAvgTimeEl.textContent = data.avgPaymentTime;
+  
+  const rankingContainer = document.getElementById('merchant-ranking');
+  if (rankingContainer) {
     rankingContainer.innerHTML = data.ranking.slice(0, 10).map((m, idx) => `
       <div class="ranking-item">
         <div class="ranking-position">#${idx + 1}</div>
@@ -503,9 +863,10 @@ async function loadPIX() {
         </div>
       </div>
     `).join('');
-    
-    // Top valores
-    const valuesContainer = document.getElementById('top-values');
+  }
+  
+  const valuesContainer = document.getElementById('top-values');
+  if (valuesContainer) {
     valuesContainer.innerHTML = data.topValues.slice(0, 10).map((v, idx) => `
       <div class="value-item">
         <span>#${idx + 1}</span>
@@ -513,9 +874,11 @@ async function loadPIX() {
         <span>${v.count}x</span>
       </div>
     `).join('');
-  } catch (error) {
-    console.error('Erro ao carregar PIX:', error);
   }
+}
+
+async function loadPIX() {
+  loadPIXInstant();
 }
 
 // ===== NOTIFICAÇÕES =====
@@ -594,7 +957,7 @@ async function editNotification(id) {
   }
 }
 
-document.getElementById('notification-form').addEventListener('submit', async (e) => {
+document.getElementById('notification-form')?.addEventListener('submit', async (e) => {
   e.preventDefault();
   
   const data = {
@@ -608,7 +971,6 @@ document.getElementById('notification-form').addEventListener('submit', async (e
   
   try {
     if (editingNotificationId) {
-      // Editar existente
       await fetch(`/api/notifications/${editingNotificationId}`, {
         method: 'PUT',
         headers: {'Content-Type': 'application/json'},
@@ -616,7 +978,6 @@ document.getElementById('notification-form').addEventListener('submit', async (e
       });
       showToast('✅ Notificação atualizada');
     } else {
-      // Criar nova
       await fetch('/api/notifications', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
@@ -715,4 +1076,11 @@ function showToast(message) {
     toast.style.animation = 'slideOut 0.3s ease';
     setTimeout(() => toast.remove(), 300);
   }, 3000);
+}
+
+// ===== FORÇAR ATUALIZAÇÃO =====
+async function forceRefresh() {
+  showToast('🔄 Atualizando dados...');
+  await loadAllTransactions();
+  applyFiltersInstant();
 }

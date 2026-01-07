@@ -14,28 +14,28 @@ const CONFIG = {
   DHR_API_URL: 'https://api.dhrtecnologialtda.com/v1',
   CHECK_INTERVAL: 5000,
   PORT: process.env.PORT || 3005,
-  CACHE_TTL: 300000, // Cache de 5 minutos para carregar mais rapido
+  BACKGROUND_REFRESH: 10000, // Buscar novas transações a cada 10 segundos (tempo real)
   MAX_RETRIES: 3,
-  RETRY_DELAY: 2000 // 2 segundos entre retries
+  RETRY_DELAY: 2000
 };
 
 const FILES = {
   notifications: path.join(__dirname, 'notifications.json'),
-  processed: path.join(__dirname, 'processed.json')
+  processed: path.join(__dirname, 'processed.json'),
+  transactionsCache: path.join(__dirname, 'transactions_cache.json') // CACHE PERSISTENTE
 };
 
 let notifications = [];
 let processedEvents = new Set();
 
-// ===== CACHE =====
+// ===== CACHE PERSISTENTE =====
 let transactionsCache = {
-  data: null,
-  timestamp: 0
+  data: [],           // Array de transações
+  lastId: null,       // ID da última transação (para busca incremental)
+  lastUpdate: 0,      // Timestamp da última atualização
+  isLoading: false,
+  totalRecords: 0
 };
-
-function isCacheValid() {
-  return transactionsCache.data && (Date.now() - transactionsCache.timestamp < CONFIG.CACHE_TTL);
-}
 
 // ===== UTILITÁRIOS =====
 
@@ -52,11 +52,43 @@ async function saveFile(filepath, data) {
   await fs.writeFile(filepath, JSON.stringify(data, null, 2));
 }
 
+// Salvar cache de forma otimizada (sem formatação para ser mais rápido)
+async function saveCacheFile() {
+  try {
+    const cacheData = {
+      data: transactionsCache.data,
+      lastId: transactionsCache.lastId,
+      lastUpdate: transactionsCache.lastUpdate,
+      totalRecords: transactionsCache.totalRecords
+    };
+    await fs.writeFile(FILES.transactionsCache, JSON.stringify(cacheData));
+    console.log(`💾 Cache salvo: ${transactionsCache.data.length} transações`);
+  } catch (err) {
+    console.error('❌ Erro ao salvar cache:', err.message);
+  }
+}
+
+// Carregar cache do disco
+async function loadCacheFile() {
+  try {
+    const data = await fs.readFile(FILES.transactionsCache, 'utf-8');
+    const cache = JSON.parse(data);
+    transactionsCache.data = cache.data || [];
+    transactionsCache.lastId = cache.lastId || null;
+    transactionsCache.lastUpdate = cache.lastUpdate || 0;
+    transactionsCache.totalRecords = cache.totalRecords || 0;
+    console.log(`📂 Cache carregado do disco: ${transactionsCache.data.length} transações`);
+    return true;
+  } catch {
+    console.log('📂 Nenhum cache encontrado, será criado um novo');
+    return false;
+  }
+}
+
 function getAuth() {
   return 'Basic ' + Buffer.from(`${CONFIG.DHR_PUBLIC_KEY}:${CONFIG.DHR_SECRET_KEY}`).toString('base64');
 }
 
-// Função de delay para retry
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -70,7 +102,7 @@ async function fetchDHR(endpoint, retries = CONFIG.MAX_RETRIES) {
           'Authorization': getAuth(),
           'Connection': 'keep-alive'
         },
-        timeout: 30000 // 30 segundos de timeout
+        timeout: 30000
       });
       
       if (!response.ok) {
@@ -80,53 +112,49 @@ async function fetchDHR(endpoint, retries = CONFIG.MAX_RETRIES) {
       return await response.json();
     } catch (error) {
       if (attempt === retries) {
-        console.error(`  ❌ Falha após ${retries} tentativas: ${error.message}`);
         throw error;
       }
-      console.log(`  ⚠️  Tentativa ${attempt}/${retries} falhou, tentando novamente em ${CONFIG.RETRY_DELAY}ms...`);
       await delay(CONFIG.RETRY_DELAY);
     }
   }
 }
 
-// Buscar TODAS as transações com paginação automática e cache
-async function fetchAllTransactions(forceRefresh = false) {
-  // Verificar cache primeiro
-  if (!forceRefresh && isCacheValid()) {
-    console.log('📦 Usando dados do cache');
+// ===== BUSCA INCREMENTAL =====
+
+// Buscar TODAS as transações (usado apenas na primeira vez ou rebuild)
+async function fetchAllTransactionsFull() {
+  // Evitar múltiplas buscas simultâneas
+  if (transactionsCache.isLoading) {
+    console.log('⚠️ Busca já em andamento, ignorando...');
     return transactionsCache.data;
   }
-
+  
+  transactionsCache.isLoading = true;
+  console.log('🔄 Buscando TODAS as transações da API (primeira vez)...');
+  
   let allTransactions = [];
-  let page = 1;
-  const pageSize = 500; // Aumentado para menos requisicoes
-  let totalPages = null;
+  const pageSize = 500;
   
-  console.log('🔄 Buscando todas as transações da API...');
-  
-  // Primeira requisicao para descobrir total de paginas
   try {
+    // Primeira requisição para descobrir total
     const firstData = await fetchDHR(`/transactions?page=1&pageSize=${pageSize}`);
     const firstTransactions = firstData.data || [];
     const pagination = firstData.pagination || {};
+    const totalPages = pagination.totalPages || 1;
+    const totalRecords = pagination.totalRecords || 0;
     
-    totalPages = pagination.totalPages || 1;
-    console.log(`  📊 Total de registros: ${pagination.totalRecords} (${totalPages} paginas)`);
+    console.log(`  📊 Total: ${totalRecords} transações em ${totalPages} páginas`);
     
     allTransactions = [...firstTransactions];
     
-    if (totalPages <= 1) {
-      // Apenas 1 pagina, ja temos tudo
-      console.log('  ✅ Apenas 1 pagina, dados completos');
-    } else {
-      // Buscar demais paginas em PARALELO (maximo 5 de cada vez)
+    if (totalPages > 1) {
+      // Buscar demais páginas em paralelo (lotes de 10)
       const remainingPages = [];
       for (let p = 2; p <= totalPages; p++) {
         remainingPages.push(p);
       }
       
-      // Processar em lotes de 5 paginas simultaneas
-      const batchSize = 5;
+      const batchSize = 10; // Aumentado para ser mais rápido
       for (let i = 0; i < remainingPages.length; i += batchSize) {
         const batch = remainingPages.slice(i, i + batchSize);
         const promises = batch.map(p => fetchDHR(`/transactions?page=${p}&pageSize=${pageSize}`));
@@ -138,68 +166,100 @@ async function fetchAllTransactions(forceRefresh = false) {
           }
         });
         
-        console.log(`  📥 Carregadas paginas ${batch[0]}-${batch[batch.length-1]} de ${totalPages}`);
+        const progress = Math.min(100, Math.round((i + batchSize) / remainingPages.length * 100));
+        console.log(`  📥 Progresso: ${progress}% (${allTransactions.length} transações)`);
       }
     }
+    
+    // Ordenar por data (mais recente primeiro)
+    allTransactions.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    
+    // Atualizar cache
+    transactionsCache.data = allTransactions;
+    transactionsCache.lastId = allTransactions[0]?.id || null;
+    transactionsCache.lastUpdate = Date.now();
+    transactionsCache.totalRecords = allTransactions.length;
+    
+    // Salvar em disco
+    await saveCacheFile();
+    
+    console.log(`✅ Cache completo: ${allTransactions.length} transações`);
+    transactionsCache.isLoading = false;
+    return allTransactions;
+    
   } catch (err) {
-    console.error('Erro ao buscar transacoes:', err.message);
+    console.error('❌ Erro ao buscar transações:', err.message);
+    transactionsCache.isLoading = false;
     throw err;
   }
-  
-  // Codigo antigo comentado - busca sequencial
-  /*
-  while (true) {
-    try {
-      const data = await fetchDHR(`/transactions?page=${page}&pageSize=${pageSize}`);
-      const transactions = data.data || [];
-      const pagination = data.pagination || {};
-      
-      // Primeira requisição: descobrir total de páginas
-      if (totalPages === null && pagination.totalPages) {
-        totalPages = pagination.totalPages;
-        console.log(`  📊 Total de registros: ${pagination.totalRecords} (${totalPages} páginas)`);
-      }
-      
-      if (transactions.length === 0) {
-        break;
-      }
-      
-      allTransactions = allTransactions.concat(transactions);
-      console.log(`  📄 Página ${page}/${totalPages || '?'}: ${transactions.length} transações (total: ${allTransactions.length})`);
-      
-      // Parar se chegou na última página
-      if (totalPages && page >= totalPages) {
-        break;
-      }
-      
-      // Limite de segurança: máximo 1000 páginas (200.000 transações)
-      if (page >= 1000) {
-        console.log('  ⚠️  Limite de segurança atingido (1000 páginas)');
-        break;
-      }
-      
-      page++;
-      
-      // Pequeno delay entre páginas para não sobrecarregar a API
-      if (page % 5 === 0) {
-        await delay(500);
-      }
-    } catch (error) {
-      console.error(`  ❌ Erro na página ${page}:`, error.message);
-      break;
-    }
+}
+
+// Buscar apenas transações NOVAS (incremental)
+async function fetchNewTransactions() {
+  if (transactionsCache.isLoading) return;
+  if (transactionsCache.data.length === 0) {
+    // Primeira vez, precisa buscar tudo
+    return await fetchAllTransactionsFull();
   }
-  */
   
-  console.log(`✅ Total de transações buscadas: ${allTransactions.length}`);
+  transactionsCache.isLoading = true;
   
-  // Atualizar cache
-  transactionsCache = {
-    data: allTransactions,
-    timestamp: Date.now()
-  };
-  
-  return allTransactions;
+  try {
+    // Buscar primeira página para ver se tem novidades
+    const data = await fetchDHR('/transactions?page=1&pageSize=100');
+    const newTxs = data.data || [];
+    
+    if (newTxs.length === 0) {
+      transactionsCache.isLoading = false;
+      return transactionsCache.data;
+    }
+    
+    // Encontrar transações que ainda não temos
+    const existingIds = new Set(transactionsCache.data.map(t => t.id));
+    const brandNew = newTxs.filter(t => !existingIds.has(t.id));
+    
+    if (brandNew.length > 0) {
+      console.log(`🆕 ${brandNew.length} novas transações encontradas`);
+      
+      // Adicionar no início (mais recentes primeiro)
+      transactionsCache.data = [...brandNew, ...transactionsCache.data];
+      transactionsCache.lastId = transactionsCache.data[0]?.id;
+      transactionsCache.lastUpdate = Date.now();
+      transactionsCache.totalRecords = transactionsCache.data.length;
+      
+      // Salvar em disco
+      await saveCacheFile();
+    }
+    
+    // Verificar se alguma transação mudou de status (ex: pending -> paid)
+    let updated = 0;
+    for (const newTx of newTxs) {
+      const existing = transactionsCache.data.find(t => t.id === newTx.id);
+      if (existing && existing.status !== newTx.status) {
+        // Atualizar status
+        Object.assign(existing, newTx);
+        updated++;
+      }
+    }
+    
+    if (updated > 0) {
+      console.log(`🔄 ${updated} transações atualizadas`);
+      await saveCacheFile();
+    }
+    
+    transactionsCache.isLoading = false;
+    return transactionsCache.data;
+    
+  } catch (err) {
+    console.error('❌ Erro ao buscar novas transações:', err.message);
+    transactionsCache.isLoading = false;
+    return transactionsCache.data;
+  }
+}
+
+// Retorna dados do cache (instantâneo)
+function getTransactionsFromCache() {
+  return transactionsCache.data;
 }
 
 // ===== FILTROS =====
@@ -208,13 +268,11 @@ function applyFilters(transactions, filters) {
   let result = [...transactions];
 
   if (filters.startDate) {
-    // Ajustar para GMT-3 (São Paulo)
     const start = new Date(filters.startDate + 'T00:00:00-03:00').getTime();
     result = result.filter(t => new Date(t.createdAt).getTime() >= start);
   }
 
   if (filters.endDate) {
-    // Ajustar para GMT-3 (São Paulo)
     const end = new Date(filters.endDate + 'T23:59:59-03:00').getTime();
     result = result.filter(t => new Date(t.createdAt).getTime() <= end);
   }
@@ -244,9 +302,6 @@ function applyFilters(transactions, filters) {
 // ===== ANÁLISES =====
 
 function analyzeDashboard(transactions) {
-  // transactions já vem filtrado pelo período selecionado
-  
-  // Calcular leads únicos (CPFs únicos) do período
   const uniqueLeads = new Set();
   transactions.forEach(t => {
     if (t.customer && t.customer.document && t.customer.document.number) {
@@ -278,7 +333,6 @@ function analyzeDashboard(transactions) {
     };
   };
 
-  // Calcular vendas por hora (baseado no período filtrado)
   const hourly = Array(24).fill(0).map(() => ({sales:0, amount:0}));
   transactions.filter(t => t.status === 'paid').forEach(t => {
     const date = new Date(t.createdAt);
@@ -291,7 +345,6 @@ function analyzeDashboard(transactions) {
   const bestHour = hourly.reduce((best, curr, idx) => 
     curr.sales > hourly[best].sales ? idx : best, 0);
 
-  // Calcular vendas por dia da semana (baseado no período filtrado)
   const weekdays = ['Dom','Seg','Ter','Qua','Qui','Sex','Sáb'];
   const byWeekday = weekdays.map(d => ({day:d, sales:0, amount:0}));
   transactions.filter(t => t.status === 'paid').forEach(t => {
@@ -302,7 +355,6 @@ function analyzeDashboard(transactions) {
     byWeekday[d].amount += (t.amount||0) / 100;
   });
 
-  // Calcular últimos 7 e 30 dias baseado na data final do período
   const allTxs = transactions;
   const latestDate = allTxs.length > 0 
     ? Math.max(...allTxs.map(t => new Date(t.createdAt).getTime()))
@@ -315,7 +367,8 @@ function analyzeDashboard(transactions) {
   const monthTxs = allTxs.filter(t => new Date(t.createdAt) >= monthAgo);
 
   return {
-    period: calc(transactions),  // Renomear de "today" para "period"
+    period: calc(transactions),
+    today: calc(transactions),
     week: calc(weekTxs),
     month: calc(monthTxs),
     hourly,
@@ -326,18 +379,15 @@ function analyzeDashboard(transactions) {
 }
 
 function analyzeProductsSoldByDate(transactions, startDate = null, endDate = null) {
-  // Se não passar datas, usa hoje
   let dayStartBrazil, dayEndBrazil;
   
   if (startDate) {
-    // Usar data inicial fornecida (formato: YYYY-MM-DD)
     const [year, month, day] = startDate.split('-').map(Number);
-    dayStartBrazil = new Date(Date.UTC(year, month - 1, day, 3, 0, 0, 0)); // 00:00 Brasil = 03:00 UTC
+    dayStartBrazil = new Date(Date.UTC(year, month - 1, day, 3, 0, 0, 0));
   } else {
-    // Usar hoje
     const now = new Date();
     const nowUTC = now.getTime();
-    const brazilNow = new Date(nowUTC - (3 * 60 * 60 * 1000)); // UTC-3
+    const brazilNow = new Date(nowUTC - (3 * 60 * 60 * 1000));
     dayStartBrazil = new Date(Date.UTC(
       brazilNow.getUTCFullYear(),
       brazilNow.getUTCMonth(), 
@@ -347,15 +397,12 @@ function analyzeProductsSoldByDate(transactions, startDate = null, endDate = nul
   }
   
   if (endDate) {
-    // Usar data final fornecida (formato: YYYY-MM-DD)
     const [year, month, day] = endDate.split('-').map(Number);
-    dayEndBrazil = new Date(Date.UTC(year, month - 1, day, 3 + 23, 59, 59, 999)); // 23:59 Brasil
+    dayEndBrazil = new Date(Date.UTC(year, month - 1, day, 3 + 23, 59, 59, 999));
   } else if (startDate) {
-    // Se só passou startDate, usar o mesmo dia como fim
     const [year, month, day] = startDate.split('-').map(Number);
     dayEndBrazil = new Date(Date.UTC(year, month - 1, day, 3 + 23, 59, 59, 999));
   } else {
-    // Usar hoje
     const now = new Date();
     const nowUTC = now.getTime();
     const brazilNow = new Date(nowUTC - (3 * 60 * 60 * 1000));
@@ -367,26 +414,16 @@ function analyzeProductsSoldByDate(transactions, startDate = null, endDate = nul
     ));
   }
   
-  const dateLabel = startDate ? (endDate && endDate !== startDate ? `${startDate} a ${endDate}` : startDate) : 'hoje';
-  console.log(`📅 Filtrando vendas de ${dateLabel} (Brasil):`);
-  console.log(`  Início: ${dayStartBrazil.toISOString()} (UTC)`);
-  console.log(`  Fim: ${dayEndBrazil.toISOString()} (UTC)`);
-  
-  // Filtrar transações pelo período
   const filteredTxs = transactions.filter(t => {
     const txTime = new Date(t.createdAt).getTime();
     return txTime >= dayStartBrazil.getTime() && txTime <= dayEndBrazil.getTime();
   });
   
-  console.log(`  ✅ ${filteredTxs.length} transações encontradas`);
-  
   const productMap = {};
   
   filteredTxs.forEach(t => {
     if (t.items && t.items[0] && t.items[0].title) {
-      // Extrair apenas o código da passarela, removendo " - Placa XXX"
       let productName = t.items[0].title;
-      // Remove a parte da placa (ex: " - Placa FKO2094")
       productName = productName.replace(/\s*-\s*Placa\s+[A-Z0-9]+/i, '');
       
       const quantity = t.items[0].quantity || 1;
@@ -422,22 +459,14 @@ function analyzeProductsSoldByDate(transactions, startDate = null, endDate = nul
     }
   });
   
-  // Converter para array e ordenar por valor líquido (maior para menor)
-  const products = Object.values(productMap)
+  return Object.values(productMap)
     .map(p => ({
       ...p,
       avgTicket: p.paidSales > 0 ? (p.paidAmount / p.paidSales).toFixed(2) : '0.00',
       avgNetTicket: p.paidSales > 0 ? (p.paidNetAmount / p.paidSales).toFixed(2) : '0.00'
     }))
-    .filter(p => p.paidSales > 0) // Mostrar apenas produtos com vendas pagas
+    .filter(p => p.paidSales > 0)
     .sort((a, b) => b.paidNetAmount - a.paidNetAmount);
-  
-  return products;
-}
-
-// Manter compatibilidade com a função antiga
-function analyzeProductsSoldToday(transactions) {
-  return analyzeProductsSoldByDate(transactions, null, null);
 }
 
 function analyzePIX(transactions) {
@@ -447,9 +476,8 @@ function analyzePIX(transactions) {
 
   const merchantMap = {};
   pixTxs.forEach(t => {
-    // Decodificar código PIX para extrair MERCHANT/ADQUIRENTE
     const pixInfo = decodePIX(t.pix?.qrcode);
-    const name = pixInfo.full; // Ex: VIXONSISTEMALTDA/pagsm.com.br
+    const name = pixInfo.full;
     
     if (!merchantMap[name]) {
       merchantMap[name] = {
@@ -577,164 +605,157 @@ const app = express();
 app.use(express.json());
 app.use(express.static('public'));
 
-app.get('/api/products', async (req, res) => {
-  try {
-    const txs = await fetchAllTransactions();
-    const products = new Set();
-    
-    txs.forEach(t => {
-      if (t.items && t.items[0] && t.items[0].title) {
-        const productType = t.items[0].title.split(' - ')[0].trim();
-        products.add(productType);
-      }
-    });
-    
-    res.json(Array.from(products).sort());
-  } catch (err) {
-    res.status(500).json({error: err.message});
-  }
+// Endpoint para obter TODAS as transações do cache (INSTANTÂNEO)
+app.get('/api/all-transactions', (req, res) => {
+  const txs = getTransactionsFromCache();
+  res.json({
+    data: txs,
+    cacheTimestamp: transactionsCache.lastUpdate,
+    isLoading: transactionsCache.isLoading,
+    totalRecords: txs.length
+  });
 });
 
-app.get('/api/dashboard', async (req, res) => {
-  try {
-    let txs = await fetchAllTransactions();
-    txs = applyFilters(txs, req.query);
-    res.json(analyzeDashboard(txs));
-  } catch (err) {
-    res.status(500).json({error: err.message});
-  }
+// Status do cache
+app.get('/api/cache-status', (req, res) => {
+  res.json({
+    timestamp: transactionsCache.lastUpdate,
+    isLoading: transactionsCache.isLoading,
+    totalRecords: transactionsCache.data.length,
+    age: Date.now() - transactionsCache.lastUpdate
+  });
 });
 
-app.get('/api/pix', async (req, res) => {
-  try {
-    let txs = await fetchAllTransactions();
-    txs = applyFilters(txs, {...req.query, paymentMethod: 'pix'});
-    res.json(analyzePIX(txs));
-  } catch (err) {
-    res.status(500).json({error: err.message});
-  }
+app.get('/api/products', (req, res) => {
+  const txs = getTransactionsFromCache();
+  const products = new Set();
+  
+  txs.forEach(t => {
+    if (t.items && t.items[0] && t.items[0].title) {
+      const productType = t.items[0].title.split(' - ')[0].trim();
+      products.add(productType);
+    }
+  });
+  
+  res.json(Array.from(products).sort());
 });
 
-app.get('/api/products-sold-today', async (req, res) => {
-  try {
-    const { startDate, endDate } = req.query;
-    const txs = await fetchAllTransactions();
-    const products = analyzeProductsSoldByDate(txs, startDate || null, endDate || null);
-    res.json(products);
-  } catch (err) {
-    res.status(500).json({error: err.message});
-  }
+app.get('/api/dashboard', (req, res) => {
+  let txs = getTransactionsFromCache();
+  txs = applyFilters(txs, req.query);
+  res.json(analyzeDashboard(txs));
 });
 
-app.get('/api/transactions', async (req, res) => {
-  try {
-    let allTxs = await fetchAllTransactions();
-    allTxs = applyFilters(allTxs, req.query);
-    
-    const page = parseInt(req.query.page) || 1;
-    const pageSize = parseInt(req.query.pageSize) || 50;
-    const start = (page - 1) * pageSize;
-    const end = start + pageSize;
-    
-    const paginatedTxs = allTxs.slice(start, end);
-    
-    res.json({
-      data: paginatedTxs,
-      pagination: {
-        page,
-        pageSize,
-        totalRecords: allTxs.length,
-        totalPages: Math.ceil(allTxs.length / pageSize)
-      }
-    });
-  } catch (err) {
-    res.status(500).json({error: err.message});
-  }
+app.get('/api/pix', (req, res) => {
+  let txs = getTransactionsFromCache();
+  txs = applyFilters(txs, {...req.query, paymentMethod: 'pix'});
+  res.json(analyzePIX(txs));
 });
 
-app.get('/api/sales', async (req, res) => {
-  try {
-    let allTxs = await fetchAllTransactions();
-    allTxs = applyFilters(allTxs, req.query);
-    
-    const sales = allTxs
-      .filter(t => t.status === 'paid')
-      .map(t => ({
-        id: t.id,
-        date: t.createdAt,
-        customer: t.customer?.name || 'N/A',
-        email: t.customer?.email || 'N/A',
-        document: t.customer?.document?.number || 'N/A',
-        product: t.items?.[0]?.title || 'N/A',
-        amount: (t.amount || 0) / 100,
-        netAmount: (t.fee?.netAmount || 0) / 100,
-        fee: ((t.amount || 0) - (t.fee?.netAmount || 0)) / 100,
-        method: t.paymentMethod || 'N/A',
-        installments: t.installments || 1
-      }));
-    
-    res.json(sales);
-  } catch (err) {
-    res.status(500).json({error: err.message});
-  }
+app.get('/api/products-sold-today', (req, res) => {
+  const { startDate, endDate } = req.query;
+  const txs = getTransactionsFromCache();
+  const products = analyzeProductsSoldByDate(txs, startDate || null, endDate || null);
+  res.json(products);
 });
 
-app.get('/api/leads', async (req, res) => {
-  try {
-    let allTxs = await fetchAllTransactions();
-    allTxs = applyFilters(allTxs, req.query);
-    
-    const leadsMap = {};
-    
-    allTxs.forEach(t => {
-      const doc = t.customer?.document?.number;
-      if (!doc) return;
-      
-      if (!leadsMap[doc]) {
-        leadsMap[doc] = {
-          document: doc,
-          name: t.customer?.name || 'N/A',
-          email: t.customer?.email || 'N/A',
-          phone: t.customer?.phone || 'N/A',
-          firstPurchase: t.createdAt,
-          lastPurchase: t.createdAt,
-          totalPurchases: 0,
-          paidPurchases: 0,
-          totalSpent: 0,
-          products: new Set()
-        };
-      }
-      
-      const lead = leadsMap[doc];
-      lead.totalPurchases++;
-      
-      if (t.status === 'paid') {
-        lead.paidPurchases++;
-        lead.totalSpent += (t.amount || 0) / 100;
-      }
-      
-      if (new Date(t.createdAt) < new Date(lead.firstPurchase)) {
-        lead.firstPurchase = t.createdAt;
-      }
-      if (new Date(t.createdAt) > new Date(lead.lastPurchase)) {
-        lead.lastPurchase = t.createdAt;
-      }
-      
-      if (t.items?.[0]?.title) {
-        const productType = t.items[0].title.split(' - ')[0].trim();
-        lead.products.add(productType);
-      }
-    });
-    
-    const leads = Object.values(leadsMap).map(l => ({
-      ...l,
-      products: Array.from(l.products).join(', ')
+app.get('/api/transactions', (req, res) => {
+  let allTxs = getTransactionsFromCache();
+  allTxs = applyFilters(allTxs, req.query);
+  
+  const page = parseInt(req.query.page) || 1;
+  const pageSize = parseInt(req.query.pageSize) || 50;
+  const start = (page - 1) * pageSize;
+  const end = start + pageSize;
+  
+  const paginatedTxs = allTxs.slice(start, end);
+  
+  res.json({
+    data: paginatedTxs,
+    pagination: {
+      page,
+      pageSize,
+      totalRecords: allTxs.length,
+      totalPages: Math.ceil(allTxs.length / pageSize)
+    }
+  });
+});
+
+app.get('/api/sales', (req, res) => {
+  let allTxs = getTransactionsFromCache();
+  allTxs = applyFilters(allTxs, req.query);
+  
+  const sales = allTxs
+    .filter(t => t.status === 'paid')
+    .map(t => ({
+      id: t.id,
+      date: t.createdAt,
+      customer: t.customer?.name || 'N/A',
+      email: t.customer?.email || 'N/A',
+      document: t.customer?.document?.number || 'N/A',
+      product: t.items?.[0]?.title || 'N/A',
+      amount: (t.amount || 0) / 100,
+      netAmount: (t.fee?.netAmount || 0) / 100,
+      fee: ((t.amount || 0) - (t.fee?.netAmount || 0)) / 100,
+      method: t.paymentMethod || 'N/A',
+      installments: t.installments || 1
     }));
+  
+  res.json(sales);
+});
+
+app.get('/api/leads', (req, res) => {
+  let allTxs = getTransactionsFromCache();
+  allTxs = applyFilters(allTxs, req.query);
+  
+  const leadsMap = {};
+  
+  allTxs.forEach(t => {
+    const doc = t.customer?.document?.number;
+    if (!doc) return;
     
-    res.json(leads);
-  } catch (err) {
-    res.status(500).json({error: err.message});
-  }
+    if (!leadsMap[doc]) {
+      leadsMap[doc] = {
+        document: doc,
+        name: t.customer?.name || 'N/A',
+        email: t.customer?.email || 'N/A',
+        phone: t.customer?.phone || 'N/A',
+        firstPurchase: t.createdAt,
+        lastPurchase: t.createdAt,
+        totalPurchases: 0,
+        paidPurchases: 0,
+        totalSpent: 0,
+        products: new Set()
+      };
+    }
+    
+    const lead = leadsMap[doc];
+    lead.totalPurchases++;
+    
+    if (t.status === 'paid') {
+      lead.paidPurchases++;
+      lead.totalSpent += (t.amount || 0) / 100;
+    }
+    
+    if (new Date(t.createdAt) < new Date(lead.firstPurchase)) {
+      lead.firstPurchase = t.createdAt;
+    }
+    if (new Date(t.createdAt) > new Date(lead.lastPurchase)) {
+      lead.lastPurchase = t.createdAt;
+    }
+    
+    if (t.items?.[0]?.title) {
+      const productType = t.items[0].title.split(' - ')[0].trim();
+      lead.products.add(productType);
+    }
+  });
+  
+  const leads = Object.values(leadsMap).map(l => ({
+    ...l,
+    products: Array.from(l.products).join(', ')
+  }));
+  
+  res.json(leads);
 });
 
 // Notificações
@@ -772,47 +793,85 @@ app.delete('/api/notifications/:id', async (req, res) => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    cache: isCacheValid() ? 'valid' : 'expired',
-    transactions: transactionsCache.data?.length || 0
+    cacheAge: Date.now() - transactionsCache.lastUpdate,
+    transactions: transactionsCache.data.length,
+    isLoading: transactionsCache.isLoading
   });
 });
 
-// Endpoint para forçar refresh do cache
+// Forçar refresh do cache (busca incremental)
 app.post('/api/refresh', async (req, res) => {
-  try {
-    console.log('🔄 Forçando atualização do cache...');
-    const txs = await fetchAllTransactions(true);
-    res.json({ success: true, transactions: txs.length });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  console.log('🔄 Atualizando cache...');
+  await fetchNewTransactions();
+  res.json({ success: true, transactions: transactionsCache.data.length });
+});
+
+// Forçar rebuild completo do cache
+app.post('/api/rebuild-cache', async (req, res) => {
+  console.log('🔄 Reconstruindo cache completo...');
+  transactionsCache.data = [];
+  await fetchAllTransactionsFull();
+  res.json({ success: true, transactions: transactionsCache.data.length });
 });
 
 // ===== INICIALIZAÇÃO =====
+
+let backgroundRefreshInterval = null;
 
 async function init() {
   notifications = await loadFile(FILES.notifications);
   const processed = await loadFile(FILES.processed);
   processedEvents = new Set(processed);
 
-  console.log('\n🚀 DHR Analytics PRO');
+  console.log('\n🚀 DHR Analytics PRO - INSTANT LOAD');
   console.log(`📍 http://localhost:${CONFIG.PORT}`);
-  console.log(`💾 Cache TTL: ${CONFIG.CACHE_TTL / 1000}s`);
-  console.log(`🔄 Retry: ${CONFIG.MAX_RETRIES} tentativas\n`);
+  console.log(`🔄 Background refresh: ${CONFIG.BACKGROUND_REFRESH / 1000}s\n`);
 
+  // PRIMEIRO: Carregar cache do disco (INSTANTÂNEO)
+  const cacheLoaded = await loadCacheFile();
+  
+  // Iniciar servidor IMEDIATAMENTE (não espera API)
   app.listen(CONFIG.PORT, () => {
     console.log(`✅ Servidor rodando na porta ${CONFIG.PORT}`);
+    if (cacheLoaded) {
+      console.log(`⚡ Cache disponível: ${transactionsCache.data.length} transações`);
+    }
   });
   
-  // Buscar dados iniciais
-  try {
-    await fetchAllTransactions();
-  } catch (err) {
-    console.error('⚠️  Erro ao buscar dados iniciais:', err.message);
+  // Se não tinha cache, buscar em background e SÓ DEPOIS iniciar o intervalo
+  if (!cacheLoaded) {
+    console.log('📥 Buscando transações da API em background...');
+    fetchAllTransactionsFull()
+      .then(() => {
+        // SÓ inicia o intervalo DEPOIS que terminar o primeiro carregamento
+        startBackgroundRefresh();
+      })
+      .catch(err => {
+        console.error('⚠️ Erro ao buscar dados iniciais:', err.message);
+        // Mesmo com erro, inicia o intervalo para tentar novamente
+        startBackgroundRefresh();
+      });
+  } else {
+    // Se tinha cache, buscar apenas novas transações em background
+    setTimeout(() => {
+      fetchNewTransactions().catch(err => {
+        console.error('⚠️ Erro ao buscar novas transações:', err.message);
+      });
+    }, 2000);
+    
+    // Já tem cache, pode iniciar o intervalo
+    startBackgroundRefresh();
   }
   
-  // Iniciar verificação de eventos
+  // Iniciar verificação de eventos para notificações
   setInterval(checkEvents, CONFIG.CHECK_INTERVAL);
+}
+
+function startBackgroundRefresh() {
+  if (backgroundRefreshInterval) return; // Já iniciado
+  
+  console.log(`🔄 Iniciando atualização em background a cada ${CONFIG.BACKGROUND_REFRESH / 1000}s`);
+  backgroundRefreshInterval = setInterval(fetchNewTransactions, CONFIG.BACKGROUND_REFRESH);
 }
 
 init();

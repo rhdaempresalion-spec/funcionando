@@ -781,8 +781,18 @@
 </head>
 <body>
   <div class="header">
-    <div class="container">
+    <div class="container" style="display: flex; justify-content: space-between; align-items: center;">
       <img src="/logo-dhr.png" alt="DHR Analytics PRO" style="height: 120px;">
+      <div style="display: flex; align-items: center; gap: 15px;">
+        <div id="loading-indicator" style="display: none; color: var(--blue-accent);">
+          <span class="spinner" style="width: 20px; height: 20px; border-width: 2px; display: inline-block; vertical-align: middle; margin-right: 8px;"></span>
+          Carregando...
+        </div>
+        <div id="cache-indicator" style="color: var(--text-muted); font-size: 12px;">Carregando...</div>
+        <button onclick="forceRefresh()" class="btn btn-secondary" style="padding: 8px 16px; font-size: 13px;">
+          🔄 Atualizar
+        </button>
+      </div>
     </div>
   </div>
 
@@ -1178,15 +1188,18 @@
         startGroup.style.display = 'none';
         endGroup.style.display = 'none';
         
-        // Calcular datas automaticamente baseado no período
-        const today = new Date();
-        let startDate = new Date();
-        let endDate = new Date();
+        // Usar data de São Paulo (GMT-3) para garantir consistência
+        const getSaoPauloDate = () => {
+          const now = new Date();
+          // Converter para horário de São Paulo (UTC-3)
+          const utc = now.getTime() + (now.getTimezoneOffset() * 60000);
+          const saoPaulo = new Date(utc - (3 * 60 * 60000));
+          return saoPaulo;
+        };
         
-        // Ajustar para GMT-3 (horário de São Paulo)
-        const offset = -3 * 60; // GMT-3 em minutos
-        const localOffset = today.getTimezoneOffset();
-        const diff = offset - localOffset;
+        const today = getSaoPauloDate();
+        let startDate = getSaoPauloDate();
+        let endDate = getSaoPauloDate();
         
         switch(period) {
           case 'today':
@@ -1313,9 +1326,9 @@
       setupProductCheckboxes();
     });
 
-    // Função que será executada DEPOIS que o app.js carregar
+    // Função que será executada DEPOIS que o app_ultra_fast.js carregar
     function overrideApplyFilters() {
-      // Salvar a função original do app.js
+      // Salvar a função original do app_ultra_fast.js
       window.applyFiltersOriginal = window.applyFilters;
       
       // Sobrescrever com nossa versão que lê checkboxes
@@ -1348,7 +1361,7 @@
         console.log('Todos selecionados?', allSelected);
         console.log('Produtos para filtrar:', productsToFilter);
         
-        // Atualizar currentFilters (variável global do app.js)
+        // Atualizar currentFilters (variável global do app_ultra_fast.js)
         currentFilters = {
           startDate,
           endDate,
@@ -1405,7 +1418,7 @@
       // Inicializar as datas com o período "Hoje" por padrão
       onPeriodChange();
       
-      // Aguardar o app.js carregar e então sobrescrever a função applyFilters
+      // Aguardar o app_ultra_fast.js carregar e então sobrescrever a função applyFilters
       setTimeout(function() {
         // Sobrescrever applyFilters para ler checkboxes
         overrideApplyFilters();
@@ -1417,6 +1430,6 @@
       }, 500);
     });
   </script>
-  <script src="app.js"></script>
+  <script src="app_ultra_fast.js"></script>
 </body>
 </html>

@@ -11,7 +11,7 @@ const __dirname = path.dirname(__filename);
 const CONFIG = {
   DHR_PUBLIC_KEY: 'pk_WNNg2i_r8_iqeG3XrdJFI_q1I8ihd1yLoUa08Ip0LKaqxXxE',
   DHR_SECRET_KEY: 'sk_jz1yyIaa0Dw2OWhMH0r16gUgWZ7N2PCpb6aK1crKPIFq02aD',
-  DHR_API_URL: 'https://api.dhrtecnologialtda.com/v1',
+  DHR_API_URL: 'https://api.shieldtecnologia.com/v1',
   CHECK_INTERVAL: 5000,
   PORT: process.env.PORT || 3005,
   BACKGROUND_REFRESH: 10000, // Buscar novas transações a cada 10 segundos (tempo real)

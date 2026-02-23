@@ -1,7 +1,7 @@
 {
   "name": "dhr-lead-capture",
   "version": "1.0.0",
-  "description": "DHR Lead Capture → CRM DataCrazy",
+  "description": "DHR Lead Capture - CRM DataCrazy",
   "main": "server.js",
   "type": "module",
   "scripts": {
